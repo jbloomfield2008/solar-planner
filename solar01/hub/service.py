@@ -44,7 +44,8 @@ class Recorder:
         now = time.time()
         pv = float(d.get('pv_power_raw', d.get('pv_power', 0)))
         soc = float(jk['soc']) if jk else float(d.get('soc', 0))
-        self.hist.add_sample(now, float(d.get('load_power', 0)), pv, soc)
+        self.hist.add_sample(now, float(d.get('load_power', 0)), pv, soc, float(d.get('grid_import_power') or 0),
+                             float(d.get('grid_export_power') or 0))
         temps = [t for t in ((jk or {}).get('temp_1'), (jk or {}).get('temp_2')) if t is not None]
         self.hist.add_minute(now, {
             'pv_w': pv, 'load_w': d.get('load_power'), 'batt_w': d.get('battery_power'),
@@ -125,6 +126,9 @@ async def amain(cfg) -> int:
     backfilled = history.backfill_minutes()
     if backfilled:
         store.add_event('info', f'added {backfilled} hourly points to the history charts', source='hub')
+    backfilled = history.backfill_grid()
+    if backfilled:
+        store.add_event('info', f'derived grid import/export for {backfilled} hours from the minute history', source='hub')
     core = CoreClient(cfg.core.socket, store.on_core_message, name='hub')
     store.core_link = core
     planner = Planner(cfg, history, store, core)

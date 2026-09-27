@@ -1,4 +1,5 @@
-"""SQLite history: hourly energy (planner learning), minute averages (charts), events, settings.
+"""SQLite history: hourly energy (planner learning, daily and billing totals), minute averages (charts), events,
+settings.
 
 Writes go to the connection as they happen and are committed every flush_s (default
 5 min), so the SD card sees one small transaction per flush.  A crash loses at most
@@ -15,8 +16,12 @@ import threading
 MINUTE_FIELDS = ('pv_w', 'load_w', 'batt_w', 'grid_w', 'soc', 'jk_soc', 'batt_v', 'cell_min', 'cell_max', 'temp_c',
                  'ct_offset_w')
 
+HOURLY_GRID = ('grid_in_wh', 'grid_out_wh')     # NULL for hours recorded before grid energy was kept
+HOURLY_COLS = ('ts', 'load_wh', 'pv_wh', 'secs', 'soc') + HOURLY_GRID
+
 SCHEMA = f"""
-CREATE TABLE IF NOT EXISTS hourly (ts INTEGER PRIMARY KEY, load_wh REAL, pv_wh REAL, secs REAL, soc REAL);
+CREATE TABLE IF NOT EXISTS hourly (ts INTEGER PRIMARY KEY, load_wh REAL, pv_wh REAL, secs REAL, soc REAL,
+                                   grid_in_wh REAL, grid_out_wh REAL);
 CREATE TABLE IF NOT EXISTS minute (ts INTEGER PRIMARY KEY, {', '.join(f + ' REAL' for f in MINUTE_FIELDS)});
 CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, level TEXT, source TEXT,
                                    msg TEXT, data TEXT);
@@ -38,9 +43,13 @@ class History:
         for field in MINUTE_FIELDS:                  # columns added in later versions
             if field not in have:
                 self.db.execute(f'ALTER TABLE minute ADD COLUMN {field} REAL')
+        have = {r[1] for r in self.db.execute('PRAGMA table_info(hourly)')}
+        for field in HOURLY_GRID:
+            if field not in have:
+                self.db.execute(f'ALTER TABLE hourly ADD COLUMN {field} REAL')
         self.db.commit()
         self.lock = threading.RLock()
-        self.bucket = None                  # [hour ts, load_wh, pv_wh, secs, soc]
+        self.bucket = None                  # [hour ts, load_wh, pv_wh, secs, soc, grid_in_wh, grid_out_wh]
         self.last_sample = None
         self.minute = None                  # [minute ts, {field: [sum(v*dt), sum(dt)]}]
         self.last_minute_sample = None
@@ -57,7 +66,8 @@ class History:
             self.db.commit()
 
     # -- hourly energy (planner) -------------------------------------------------------------------
-    def add_sample(self, now: float, load_w: float, pv_w: float, soc: float) -> None:
+    def add_sample(self, now: float, load_w: float, pv_w: float, soc: float, grid_in_w: float = 0.0,
+                   grid_out_w: float = 0.0) -> None:
         hour = int(now // 3600) * 3600
         if self.last_sample is None:
             self.last_sample = now
@@ -69,17 +79,24 @@ class History:
         with self.lock:
             if self.bucket is None or self.bucket[0] != hour:
                 self._write_bucket()
-                row = self.db.execute('SELECT load_wh, pv_wh, secs FROM hourly WHERE ts=?', (hour,)).fetchone()
-                self.bucket = [hour, row[0], row[1], row[2], soc] if row and row[2] < 3600 else [hour, 0.0, 0.0, 0.0, soc]
+                row = self.db.execute('SELECT load_wh, pv_wh, secs, grid_in_wh, grid_out_wh FROM hourly WHERE ts=?',
+                                      (hour,)).fetchone()
+                if row and row[2] < 3600:
+                    self.bucket = [hour, row[0], row[1], row[2], soc, row[3] or 0.0, row[4] or 0.0]
+                else:
+                    self.bucket = [hour, 0.0, 0.0, 0.0, soc, 0.0, 0.0]
             b = self.bucket
             b[1] += load_w * dt_s / 3600
             b[2] += pv_w * dt_s / 3600
             b[3] += dt_s
             b[4] = soc
+            b[5] += max(grid_in_w, 0.0) * dt_s / 3600
+            b[6] += max(grid_out_w, 0.0) * dt_s / 3600
 
     def _write_bucket(self) -> None:
         if self.bucket:
-            self.db.execute('INSERT OR REPLACE INTO hourly VALUES (?,?,?,?,?)', tuple(self.bucket))
+            self.db.execute(f'INSERT OR REPLACE INTO hourly ({", ".join(HOURLY_COLS)}) VALUES (?,?,?,?,?,?,?)',
+                            tuple(self.bucket))
 
     def rows(self, since_ts: float):
         with self.lock:
@@ -179,6 +196,25 @@ class History:
             a[1] += b[2]
         return [{'date': d, 'load_kwh': round(v[0] / 1000, 2), 'pv_kwh': round(v[1] / 1000, 2)} for d, v in sorted(acc.items())]
 
+    def hourly_energy(self, since_ts: float, until_ts: float) -> list[tuple]:
+        """[(hour ts, load_wh, pv_wh, grid_in_wh, grid_out_wh)] for hours starting in [since_ts, until_ts),
+        including the hour in progress.  Grid values are None for hours recorded before they were kept."""
+        with self.lock:
+            rows = self.db.execute('SELECT ts, load_wh, pv_wh, grid_in_wh, grid_out_wh FROM hourly WHERE ts >= ? AND ts < ? '
+                                   'ORDER BY ts', (int(since_ts), int(until_ts))).fetchall()
+            b = self.bucket
+        out = {r[0]: tuple(r) for r in rows}
+        if b and since_ts <= b[0] < until_ts:
+            out[b[0]] = (b[0], b[1], b[2], b[5], b[6])
+        return [out[k] for k in sorted(out)]
+
+    def soc_near(self, ts: float, within_s: float = 900) -> tuple[float, float] | None:
+        """(minute ts, SOC) of the minute row closest to ts, BMS SOC preferred, or None if none within within_s."""
+        with self.lock:
+            r = self.db.execute('SELECT ts, COALESCE(jk_soc, soc) AS v FROM minute WHERE ts BETWEEN ? AND ? AND v IS NOT NULL '
+                                'ORDER BY ABS(ts - ?) LIMIT 1', (int(ts - within_s), int(ts + within_s), int(ts))).fetchone()
+        return (r[0], r[1]) if r else None
+
     # -- events ----------------------------------------------------------------------------------
     def add_event(self, ts: float, level: str, source: str, msg: str, data: dict | None = None) -> None:
         with self.lock:
@@ -218,7 +254,7 @@ class History:
                 kv = src.execute('SELECT k, v FROM kv').fetchall()
             finally:
                 src.close()
-            self.db.executemany('INSERT OR REPLACE INTO hourly VALUES (?,?,?,?,?)', rows)
+            self.db.executemany('INSERT OR REPLACE INTO hourly (ts, load_wh, pv_wh, secs, soc) VALUES (?,?,?,?,?)', rows)
             for k, v in kv:
                 if k in ('enabled', 'ac_chg_w'):
                     self.db.execute('INSERT OR IGNORE INTO kv VALUES (?,?)', (k, v))
@@ -244,6 +280,23 @@ class History:
             self.db.execute("INSERT OR REPLACE INTO kv VALUES ('minute_backfill_done', 'true')")
             self.db.commit()
         return len(rows)
+
+    def backfill_grid(self) -> int:
+        """Grid import/export for hours recorded before the hourly table kept them, from the minute averages
+        (net grid power, so a minute that both imported and exported counts only the net).  Runs once."""
+        with self.lock:
+            if self.get('grid_backfill_done'):
+                return 0
+            cur = self.db.execute(
+                'UPDATE hourly SET '
+                'grid_in_wh = (SELECT SUM(MAX(grid_w, 0)) / 60.0 FROM minute m WHERE m.ts >= hourly.ts AND m.ts < hourly.ts + 3600), '
+                'grid_out_wh = (SELECT SUM(MAX(-grid_w, 0)) / 60.0 FROM minute m WHERE m.ts >= hourly.ts AND m.ts < hourly.ts + 3600) '
+                'WHERE grid_in_wh IS NULL AND EXISTS (SELECT 1 FROM minute m WHERE m.ts >= hourly.ts AND m.ts < hourly.ts + 3600 '
+                'AND m.grid_w IS NOT NULL)')
+            n = cur.rowcount
+            self.db.execute("INSERT OR REPLACE INTO kv VALUES ('grid_backfill_done', 'true')")
+            self.db.commit()
+        return n
 
     def close(self) -> None:
         self.flush()

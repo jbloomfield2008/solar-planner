@@ -227,7 +227,7 @@ class HistoryWeatherTest(unittest.TestCase):
         h = History(':memory:')
         for ts, w in [(hour_ts(2026, 9, 4, 14), 1400.0), (hour_ts(2026, 9, 5, 14), 700.0),
                       (hour_ts(2026, 9, 6, 14), 700.0), (hour_ts(2026, 9, 7, 14), 700.0)]:
-            h.db.execute('INSERT INTO hourly VALUES (?,?,?,?,?)', (ts, w, 0.0, 3600.0, 50.0))
+            h.db.execute('INSERT INTO hourly (ts, load_wh, pv_wh, secs, soc) VALUES (?,?,?,?,?)', (ts, w, 0.0, 3600.0, 50.0))
         prof = h.load_profile(hour_ts(2026, 9, 8, 12), CAL, P.history_days, P.profile_prior_days)
         allmean = (1400 + 700 * 3) / 4
         self.assertAlmostEqual(prof['byhour'][14], allmean)
@@ -242,8 +242,8 @@ class HistoryWeatherTest(unittest.TestCase):
         w.k = 2.0
         for hh in (9, 10, 11, 12, 13):
             w.ghi[hour_ts(2026, 9, 8, hh)] = 500.0
-        h.db.execute('INSERT INTO hourly VALUES (?,?,?,?,?)', (hour_ts(2026, 9, 8, 9), 500.0, 1200.0, 3600.0, 50.0))
-        h.db.execute('INSERT INTO hourly VALUES (?,?,?,?,?)', (hour_ts(2026, 9, 8, 10), 500.0, 1300.0, 3600.0, 50.0))
+        h.db.execute('INSERT INTO hourly (ts, load_wh, pv_wh, secs, soc) VALUES (?,?,?,?,?)', (hour_ts(2026, 9, 8, 9), 500.0, 1200.0, 3600.0, 50.0))
+        h.db.execute('INSERT INTO hourly (ts, load_wh, pv_wh, secs, soc) VALUES (?,?,?,?,?)', (hour_ts(2026, 9, 8, 10), 500.0, 1300.0, 3600.0, 50.0))
         h.bucket = [hour_ts(2026, 9, 8, 11), 300.0, 700.0, 1800.0, 50.0]
         now_ts = hour_ts(2026, 9, 8, 11) + 1800
         exp = (1200 + 1300 + 700) / (1000 + 1000 + 500)
@@ -257,8 +257,8 @@ class HistoryWeatherTest(unittest.TestCase):
 
     def test_backfill_minutes(self):
         h = History(':memory:')
-        h.db.execute('INSERT INTO hourly VALUES (?,?,?,?,?)', (7200, 500.0, 1000.0, 3600.0, 55.0))
-        h.db.execute('INSERT INTO hourly VALUES (?,?,?,?,?)', (10800, 600.0, 0.0, 3600.0, 50.0))
+        h.db.execute('INSERT INTO hourly (ts, load_wh, pv_wh, secs, soc) VALUES (?,?,?,?,?)', (7200, 500.0, 1000.0, 3600.0, 55.0))
+        h.db.execute('INSERT INTO hourly (ts, load_wh, pv_wh, secs, soc) VALUES (?,?,?,?,?)', (10800, 600.0, 0.0, 3600.0, 50.0))
         h.add_minute(11000, {'pv_w': 1})
         h.add_minute(11030, {'pv_w': 1})
         h.flush()                                   # minute recording began inside the 10800 hour

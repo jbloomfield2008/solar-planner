@@ -16,6 +16,13 @@ Changes from solar_tou.py:
   closed loop) x battery voltage, and the grid charge rate is the measured grid share of the
   quick-charge power (PV surplus excluded), bounded by H66 and the cap.
 * Disabling the planner stops a quick charge and leaves standby straight away.
+
+Manual charge (from the web console): a quick charge to a target SOC, or for a fixed time, that
+replaces the planner's decision until it finishes, is cancelled, or hits its deadline.  It uses the
+same actuator (so the same re-arming, rate limit and core safety rules), runs whether or not the
+planner is enabled and at any time of day, and survives a hub restart (kept in kv 'manual_charge').
+A charge to a SOC gets a deadline of 1.5 x the estimated time plus 30 minutes (1 hour to
+manual_max_h), so a charge the BMS or inverter holds back cannot run on indefinitely.
 """
 from __future__ import annotations
 
@@ -74,6 +81,8 @@ class Planner:
         self._next_fetch_mono = 0.0
         self._obs_mono: float | None = None
         self.kick = asyncio.Event()
+        self.manual: dict | None = history.get('manual_charge')
+        self._manual_ended = False            # the running quick charge was the manual one, not the planner's
 
     # -- inputs ----------------------------------------------------------------------------------
     def inputs(self) -> dict | None:
@@ -135,7 +144,7 @@ class Planner:
             await self.release()
         self.kick.set()
 
-    async def release(self) -> None:
+    async def release(self, desc: str = 'planner disabled: quick charge stopped / standby released') -> None:
         x = self.inputs()
         if not x:
             return
@@ -146,7 +155,86 @@ class Planner:
         if h.get(H_QC) is not None and h[H_QC] & BIT_QC:
             regs[H_QC] = h[H_QC] & ~BIT_QC & 0xFFFF
         if regs:
-            await self.write(regs, 'planner disabled: quick charge stopped / standby released')
+            await self.write(regs, desc)
+
+    # -- manual charge ---------------------------------------------------------------------------
+    def current_soc(self, x: dict) -> float | None:
+        if x['jk'].get('soc') is not None and x['jk_age'] is not None and x['jk_age'] < 60:
+            return float(x['jk']['soc'])
+        if x['inv'].get('soc') is not None and x['inv_age'] is not None and x['inv_age'] < self.p.stale_s:
+            return float(x['inv']['soc'])
+        return None
+
+    async def start_manual(self, mode: str, target_soc=None, minutes=None, source: str = 'web') -> dict:
+        """Start (or replace) a manual charge.  ValueError with a user-facing reason if it cannot start."""
+        p = self.p
+        x = self.inputs()
+        soc = self.current_soc(x) if x else None
+        if soc is None:
+            raise ValueError('no fresh state of charge from the BMS or the inverter')
+        now = time.time()
+        if mode == 'soc':
+            if isinstance(target_soc, bool) or not isinstance(target_soc, (int, float)) or not 5 <= target_soc <= p.max_soc:
+                raise ValueError(f'target_soc must be 5..{p.max_soc:g}')
+            target = int(round(target_soc))
+            if soc >= target:
+                raise ValueError(f'the battery is already at {soc:.0f} %')
+            batt_kwh = p.batt_kwh or float(x['jk'].get('capacity') or 280) * p.nominal_v / 1000
+            rate_kw = self.limits(x)[1]
+            est_h = (target - soc) / 100 * batt_kwh / p.chg_eff / rate_kw
+            until = now + min(max(est_h * 1.5 + 0.5, 1.0), p.manual_max_h) * 3600
+            what = f'to {target} %'
+        elif mode == 'time':
+            if isinstance(minutes, bool) or not isinstance(minutes, (int, float)) \
+                    or not 5 <= minutes <= p.manual_max_h * 60:
+                raise ValueError(f'minutes must be 5..{p.manual_max_h * 60:g}')
+            target = int(p.max_soc)
+            if soc >= target:
+                raise ValueError(f'the battery is already at {soc:.0f} %')
+            until = now + minutes * 60
+            what = f'for {minutes:g} min'
+        else:
+            raise ValueError('mode must be "soc" or "time"')
+        self.manual = {'mode': mode, 'target_soc': target, 'started': round(now), 'until': round(until),
+                       'start_soc': round(soc, 1), 'source': source}
+        self.hist.set('manual_charge', self.manual)
+        stop = dt.datetime.fromtimestamp(until, self.cal.tz)
+        self.store.add_event('info', f'manual charge {what} requested at {soc:.0f} %, stops by {stop:%H:%M} ({source})',
+                             source='planner')
+        self.kick.set()
+        return self.manual
+
+    async def stop_manual(self, why: str, source: str | None = None) -> None:
+        if not self.manual:
+            return
+        self.manual = None
+        self._manual_ended = True
+        self.hist.set('manual_charge', None)
+        self.store.add_event('info', f'manual charge ended: {why}' + (f' ({source})' if source else ''), source='planner')
+        if not self.enabled:
+            await self.release('manual charge ended: quick charge stopped')
+        self.kick.set()
+
+    def manual_plan(self, plan: dict, now_dt: dt.datetime, soc: float, batt_kwh: float, load_fn, pv_fn,
+                    charge_kw: float, cap_kw: float) -> dict:
+        """The decision replaced by the manual charge, with a projection that includes it."""
+        m, p = self.manual, self.p
+        until = dt.datetime.fromtimestamp(m['until'], self.cal.tz)
+        target = m['target_soc']
+        log: list = []
+        model.simulate(p, now_dt, soc, until, batt_kwh, load_fn, pv_fn, charge_to=target, charge_kw=charge_kw, we=until,
+                       charge_from=now_dt, soc_log=log, chg_cap_kw=cap_kw)
+        eta = next((t for t, v in log if v >= target - 0.5), None)
+        kwh = max(0.0, (target - soc) / 100 * batt_kwh / p.chg_eff)
+        out = {k: v for k, v in plan.items() if k not in ('hold_start', 'hold_end', 'window_closing', 'warning')}
+        what = f'to {target} %' if m['mode'] == 'soc' else f'until {until:%H:%M}'
+        reached = f', expected to reach {target} % at {eta:%H:%M}' if eta and m['mode'] == 'soc' else ''
+        out.update(action='on', manual=True, target_soc=target, hold=False, grid_kwh=round(kwh, 2),
+                   start_at=now_dt.isoformat(timespec='minutes'), charge_end=until.isoformat(timespec='minutes'),
+                   horizon=until.isoformat(timespec='minutes'), projection=model._projection(now_dt, soc, log),
+                   manual_eta=eta.isoformat(timespec='minutes') if eta else None,
+                   reason=f'manual charge {what}{reached}; stops by {until:%H:%M} at the latest')
+        return out
 
     def next_boundary_s(self) -> float | None:
         """Seconds until the next planned start or stop in the current window."""
@@ -229,9 +317,20 @@ class Planner:
             soc, plan['soc_source'] = float(jk['soc']), 'bms'
         else:
             soc, plan['soc_source'] = float(inv.get('soc', 0)), 'inverter'
+        if self.manual:
+            m = self.manual
+            if soc >= m['target_soc']:
+                await self.stop_manual(f'reached {soc:.0f} % (target {m["target_soc"]} %)')
+            elif now >= m['until']:
+                limit = 'deadline' if m['mode'] == 'soc' else 'time'
+                await self.stop_manual(f'{limit} reached at {soc:.0f} %')
         ac_charging = bool(inv.get('state', 0) & MODE_AC_CHARGE)
         qc = holding.get(H_QC)
         currently_on = bool(qc & BIT_QC) if qc is not None else ac_charging
+        if self._manual_ended:
+            # a quick charge still running after a manual charge is not one the planner decided on: decide afresh
+            # (a charge it does not need is stopped) instead of carrying it on to the planner's own target
+            currently_on, self._manual_ended = False, False
         func = holding.get(H_FUNC)
         in_standby = (not func & BIT_NORMAL) if func is not None else False
         plan.update(ac_charging=ac_charging, quick_charge_active=currently_on,
@@ -241,6 +340,8 @@ class Planner:
         cap_kw, charge_kw = self.limits(x)
         result = await asyncio.to_thread(model.decide, p, cal, now_dt, soc, batt_kwh, load_fn, pv_fn, charge_kw,
                                          currently_on, None, pv_now_w, in_standby, cap_kw)
+        if self.manual:
+            result = self.manual_plan(result, now_dt, soc, batt_kwh, load_fn, pv_fn, charge_kw, cap_kw)
         plan.update(result)
         # a full day: this decision, then a preview of what each later window would decide
         plan.update(await asyncio.to_thread(model.rolling_projection, p, cal, now_dt, soc, batt_kwh, load_fn, pv_fn,
@@ -249,7 +350,7 @@ class Planner:
         self.forecast = [{'ts': h['ts'], 'pv_w': h['pv_w'], 'ghi': h['ghi'], 'cloud': h['cloud'], 'temp': h['temp'],
                           'load_w': round(load_fn(dt.datetime.fromtimestamp(h['ts'], cal.tz)))}
                          for h in w.hourly(now_dt, 36, now_dt)]
-        if self.enabled:
+        if self.enabled or self.manual:
             await self.actuate(plan, now_dt, holding, x['holding_age'], ac_charging)
         else:
             plan['reason'] = 'planner disabled; ' + plan.get('reason', '')
@@ -332,7 +433,7 @@ class Planner:
                     why = ' (no longer needed)'
                 desc.append('quick charge STOP' + why)
         if regs:
-            await self.write(regs, ', '.join(desc), plan)
+            await self.write(regs, ('manual charge: ' if plan.get('manual') else '') + ', '.join(desc), plan)
 
     async def write(self, regs: dict, desc: str, plan: dict | None = None) -> bool:
         self.last_write_mono = time.monotonic()
@@ -379,6 +480,7 @@ class Planner:
         projection = self.plan.get('projection') or (
             [[t0 + i * 3600, row[3]] for i, row in enumerate(self.plan.get('trace') or [])] if t0 else [])
         return {'plan': self.plan, 'forecast': self.forecast, 'enabled': self.enabled, 'dry_run': self.p.dry_run,
+                'manual': dict(self.manual, eta=self.plan.get('manual_eta')) if self.manual else None,
                 'projection': projection,
                 'tariff': self.tariff_bands(now_dt - dt.timedelta(hours=14), now_dt + dt.timedelta(hours=38)),
                 'last_error': self.last_error,

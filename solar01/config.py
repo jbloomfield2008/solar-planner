@@ -128,6 +128,7 @@ class PlannerConfig:
     projection_hours: float = 24.0
     qc_arm_min: int = 30
     qc_rearm_below: int = 10
+    manual_max_h: float = 8.0            # longest manual charge (timed, or a SOC target's deadline)
 
 
 @dc.dataclass

@@ -83,7 +83,32 @@ Whatever the hub, a bug or a LAN client asks for:
 
 Web console: `http://192.168.0.162/`. API: `/api/state`, `/api/stream` (server-sent events),
 `/api/history?hours=24`, `/api/daily?days=14`, `/api/events`, `POST /api/planner {"enabled": false}`,
-`/api/config`, `/healthz`.
+`POST /api/charge {"mode": "soc", "target_soc": 80}` or `{"mode": "time", "minutes": 60}`, `DELETE /api/charge`,
+`/api/summary`, `GET`/`PUT /api/tariff`, `/api/config`, `/healthz`.
+
+### Headline numbers, tariff and billing cycle
+
+The row of figures at the top of the console comes from `/api/summary` (`solar01/hub/summary.py`). Energy is
+integrated by the hub from the inverter's power readings into the hourly table, which records grid import and
+export as well as load and PV. Hours recorded before grid energy was kept were filled in once from the minute
+averages; hours before 2026-09-13 (the legacy scripts) have no grid data, so a cycle that reaches back that far
+is marked partial and its grid, cost and savings cover only the hours with grid data.
+
+The tariff is edited in the console (*Tariff and billing cycle*) and stored in the database (kv `tariff`,
+`solar01/hub/tariff.py`): a $/kWh rate for super off-peak, off-peak and on-peak (periods from the planner
+calendar and `on_peak`), optional usage tiers that add an amount per kWh by the cycle's running grid import
+(negative for a baseline credit), and the day of the month the cycle starts. *Cost* prices grid import;
+*saved* is the same hours' home use priced the same way, minus that cost. Seasonal rate changes are entered by
+hand.
+
+### Manual charge
+
+The planner panel can start a grid quick charge to a target SOC or for a preset time. It replaces the planner's
+decision until it finishes, is cancelled, or reaches its deadline (a SOC target gets 1.5 x the estimated time plus
+30 minutes, 1 to `manual_max_h` = 8 hours), works whether or not the planner is enabled and at any time of day
+(the console says when the current period is not super off-peak), and survives a hub restart. It uses the normal
+actuator: the quick-charge countdown is armed for at most 30 minutes and re-armed, so the firmware still ends the
+charge if the hub dies.
 
 ### Deploying (from the workstation, Git Bash)
 
@@ -102,7 +127,7 @@ active one, the last five are kept. Configuration is `/etc/solar01/config.toml` 
 
 ```
 python -m unittest discover -s tests -t .          # full test suite, no hardware needed
-python tools/seed_dev_db.py build/dev.db           # a week of fake history
+# history: copy the live database to build/dev.db (see CLAUDE.md)
 python -m solar01 --config build/dev.toml core     # simulated inverter + BMS
 python -m solar01 --config build/dev.toml hub      # web UI on http://127.0.0.1:8088/
 ```

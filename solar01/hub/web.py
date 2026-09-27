@@ -7,12 +7,18 @@ GET  /api/history       ?hours=24 -> minute averages (downsampled for long range
 GET  /api/daily         ?days=14 -> kWh per day (load, PV)
 GET  /api/events        ?limit=100
 POST /api/planner       {"enabled": true|false}
+POST /api/charge        manual charge: {"mode": "soc", "target_soc": 80} or {"mode": "time", "minutes": 60}
+DELETE /api/charge      cancel the manual charge
+GET  /api/summary       headline numbers: today's energy, SOC vs 24 h ago, billing cycle totals and cost
+GET  /api/tariff        TOU rates, usage tiers, billing cycle start day
+PUT  /api/tariff        replace them (validated; see solar01/hub/tariff.py)
 GET  /api/config        effective configuration (password redacted)
 GET  /healthz           200 when the core link is up and data is fresh, else 503
 """
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import json
 import logging
 import os
@@ -21,6 +27,8 @@ import time
 from aiohttp import web
 
 from .. import config as config_mod
+from . import tariff as tariff_mod
+from .summary import headline
 
 log = logging.getLogger('solar01.web')
 DEFAULT_STATIC = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 'web')
@@ -124,6 +132,58 @@ def create_app(store, history, cfg) -> web.Application:
         await store.planner.set_enabled(body['enabled'], source=f'web {request.remote}')
         return _json(store.planner.public())
 
+    async def charge_post(request):
+        if store.planner is None:
+            return _json({'error': 'planner not running'}, 503)
+        try:
+            body = await request.json()
+        except ValueError:
+            return _json({'error': 'expected JSON'}, 400)
+        if not isinstance(body, dict):
+            return _json({'error': 'expected an object'}, 400)
+        try:
+            await store.planner.start_manual(body.get('mode'), body.get('target_soc'), body.get('minutes'),
+                                             source=f'web {request.remote}')
+        except ValueError as e:
+            return _json({'error': str(e)}, 400)
+        return _json(store.planner.public())
+
+    async def charge_delete(request):
+        if store.planner is None:
+            return _json({'error': 'planner not running'}, 503)
+        await store.planner.stop_manual('cancelled', source=f'web {request.remote}')
+        return _json(store.planner.public())
+
+    def load_tariff() -> dict:
+        try:
+            return tariff_mod.validate(history.get('tariff') or tariff_mod.DEFAULT)
+        except ValueError:
+            log.warning('stored tariff is invalid; using the defaults')
+            return tariff_mod.validate(tariff_mod.DEFAULT)
+
+    async def tariff_get(_request):
+        return _json(load_tariff())
+
+    async def tariff_put(request):
+        try:
+            clean = tariff_mod.validate(await request.json())
+        except ValueError as e:
+            return _json({'error': str(e)}, 400)
+        await asyncio.to_thread(history.set, 'tariff', clean)
+        store.add_event('info', f'tariff settings changed ({request.remote})', source='hub')
+        return _json(clean)
+
+    async def summary_api(_request):
+        planner = store.planner
+        if planner is None:
+            return _json({'error': 'planner not running'}, 503)
+        x = planner.inputs()
+        soc = planner.current_soc(x) if x else None
+        now = dt.datetime.now(planner.cal.tz)
+        data = await asyncio.to_thread(headline, history, planner.cal, cfg.hub.planner.on_peak, load_tariff(),
+                                       planner.plan, soc, now)
+        return _json(data)
+
     async def config_api(_request):
         return _json(config_mod.redacted(cfg))
 
@@ -139,6 +199,11 @@ def create_app(store, history, cfg) -> web.Application:
     app.router.add_get('/api/daily', daily)
     app.router.add_get('/api/events', events)
     app.router.add_post('/api/planner', planner_post)
+    app.router.add_post('/api/charge', charge_post)
+    app.router.add_delete('/api/charge', charge_delete)
+    app.router.add_get('/api/summary', summary_api)
+    app.router.add_get('/api/tariff', tariff_get)
+    app.router.add_put('/api/tariff', tariff_put)
     app.router.add_get('/api/config', config_api)
     app.router.add_get('/healthz', healthz)
     if os.path.isdir(static_dir):

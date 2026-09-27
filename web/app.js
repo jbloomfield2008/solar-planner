@@ -27,6 +27,17 @@ function num(v, digits = 0) {
   if (v == null || Number.isNaN(Number(v))) return '–';
   return Number(v).toLocaleString('en-US', { minimumFractionDigits: digits, maximumFractionDigits: digits });
 }
+function money(v) {
+  if (v == null || Number.isNaN(Number(v))) return '–';
+  return `${v < 0 ? '−' : ''}$${num(Math.abs(v), 2)}`;
+}
+function kwh(v, digits = 1) {
+  return v == null ? '–' : `${num(v, digits)} kWh`;
+}
+const dateLabel = (iso) => {
+  const [yy, mm, dd] = iso.split('-').map(Number);
+  return new Intl.DateTimeFormat('en-US', { timeZone: 'UTC', month: 'short', day: 'numeric' }).format(Date.UTC(yy, mm - 1, dd, 12));
+};
 function watts(w) {
   if (w == null) return '–';
   return Math.abs(w) >= 1000 ? `${num(w / 1000, 2)} kW` : `${num(w)} W`;
@@ -168,12 +179,175 @@ function Header({ s, connected, lastRx }) {
   </header>`;
 }
 
+// ---------- headline numbers ---------------------------------------------------------------------
+function Tile({ label, value, sub, action }) {
+  return html`<div class="tile">
+    <dt>${label}</dt>
+    <dd class="tile-value">${value}</dd>
+    ${sub || action ? html`<dd class="tile-sub">${sub}${action}</dd>` : null}
+  </div>`;
+}
+
+function Headline({ s, summary, onSettings }) {
+  const inv = s.inverter.data || {};
+  const socNow = s.jk?.data?.soc ?? inv.soc;
+  const t = summary?.today || {};
+  const c = summary?.cycle;
+  const prior = summary?.soc?.prior;
+  const delta = socNow != null && prior != null ? socNow - prior : null;
+  const batt = inv.battery_power ?? 0;
+  const pct = t.pv_forecast_kwh ? Math.round((t.pv_kwh / t.pv_forecast_kwh) * 100) : null;
+  const setRates = html`<button class="link" onClick=${onSettings}>Set your rates</button>`;
+  let cycleSub = '–';
+  let costSub = null;
+  let savedSub = null;
+  if (c) {
+    const tier = c.tier != null && (c.by_tier || []).length > 1 ? `, tier ${c.tier + 1}` : '';
+    cycleSub = `Day ${c.day} of ${c.days} since ${dateLabel(c.start)}${tier}`;
+    if (c.configured) {
+      costSub = c.projected_cost != null && c.day >= 3 ? `About ${money(c.projected_cost)} by ${dateLabel(c.end)}` : `Average ${c.avg_rate != null ? `${money(c.avg_rate)}/kWh` : '–'}`;
+      savedSub = `${kwh(c.saved_kwh, c.saved_kwh < 100 ? 1 : 0)} not bought, ${money(c.home_cost)} without solar and battery`;
+    }
+    if (c.partial && c.grid_since) {
+      const since = `Grid data from ${dayLabel(c.grid_since)}`;
+      cycleSub = `${cycleSub}. ${since}`;
+    }
+  }
+  const signed = (v) => (v == null ? '–' : `${v > 0.05 ? '▲ ' : v < -0.05 ? '▼ ' : ''}${num(Math.abs(v))} pts`);
+  return html`<section class="headline" aria-labelledby="headline-title">
+    <div class="headline-head">
+      <h2 id="headline-title" class="vh">Today and this billing cycle</h2>
+      <button class="link" onClick=${onSettings}>Tariff and billing cycle</button>
+    </div>
+    <dl class="tiles">
+      <${Tile} label="Solar forecast today" value=${kwh(t.pv_forecast_kwh)} sub=${`Tomorrow ${kwh(t.pv_forecast_tomorrow_kwh)}`} />
+      <${Tile} label="Solar so far today" value=${kwh(t.pv_kwh)} sub=${`${pct != null ? `${pct} % of forecast, ` : ''}${watts(inv.pv_power)} now`} />
+      <${Tile} label="Home use today" value=${kwh(t.load_kwh)} sub=${`${watts(inv.load_power)} now`} />
+      <${Tile} label="Battery" value=${socNow == null ? '–' : `${num(socNow)} %`}
+        sub=${batt >= 20 ? `Charging ${watts(batt)}` : batt <= -20 ? `Discharging ${watts(-batt)}` : 'Idle'} />
+      <${Tile} label="Battery vs 24 h ago" value=${signed(delta)}
+        sub=${prior != null ? `${num(prior)} % at ${hhmm(summary.soc.prior_ts)} yesterday` : 'No reading from 24 hours ago'} />
+      <${Tile} label="Grid import today" value=${kwh(t.grid_kwh)} sub=${t.export_kwh ? `${kwh(t.export_kwh)} exported` : 'Nothing exported'} />
+      <${Tile} label="Grid import this cycle" value=${c ? kwh(c.grid_kwh, c.grid_kwh < 100 ? 1 : 0) : '–'} sub=${cycleSub} />
+      <${Tile} label="Cost this cycle" value=${c?.configured ? money(c.cost) : '–'} sub=${costSub} action=${c && !c.configured ? setRates : null} />
+      <${Tile} label="Saved this cycle" value=${c?.configured ? money(c.saved) : c ? kwh(c.saved_kwh, 0) : '–'}
+        sub=${c?.configured ? savedSub : c ? 'Home use minus grid import' : null} />
+    </dl>
+  </section>`;
+}
+
+const PERIOD_FIELDS = [['super_off_peak', 'Super off-peak'], ['off_peak', 'Off-peak'], ['on_peak', 'On-peak']];
+
+function TariffDialog({ open, onClose, onSaved }) {
+  const ref = useRef(null);
+  const [form, setForm] = useState(null);
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+  useEffect(() => {
+    const d = ref.current;
+    if (!d) return;
+    if (open && !d.open) {
+      setError('');
+      setForm(null);
+      fetch('/api/tariff').then((r) => r.json()).then((t) => setForm({
+        day: String(t.cycle_start_day),
+        rates: Object.fromEntries(PERIOD_FIELDS.map(([k]) => [k, String(t.rates[k] ?? 0)])),
+        tiers: t.tiers.map((x) => ({ up: x.up_to_kwh == null ? null : String(x.up_to_kwh), adder: String(x.adder) })),
+      })).catch((err) => setError(`Could not load the settings: ${err.message}`));
+      d.showModal();
+    } else if (!open && d.open) {
+      d.close();
+    }
+  }, [open]);
+  const set = (patch) => setForm((f) => ({ ...f, ...patch }));
+  const setTier = (i, patch) => set({ tiers: form.tiers.map((t, k) => (k === i ? { ...t, ...patch } : t)) });
+  const addTier = () => {
+    if (!form.tiers.length) set({ tiers: [{ up: '', adder: '' }, { up: null, adder: '0' }] });
+    else set({ tiers: [...form.tiers.slice(0, -1), { up: '', adder: '' }, form.tiers[form.tiers.length - 1]] });
+  };
+  const removeTier = (i) => {
+    const rest = form.tiers.filter((_, k) => k !== i);
+    if (rest.length === 1) return set({ tiers: [] });
+    rest[rest.length - 1] = { ...rest[rest.length - 1], up: null };
+    return set({ tiers: rest });
+  };
+  async function save(e) {
+    e.preventDefault();
+    setBusy(true);
+    setError('');
+    const body = {
+      cycle_start_day: Number(form.day),
+      rates: Object.fromEntries(PERIOD_FIELDS.map(([k]) => [k, Number(form.rates[k] || 0)])),
+      tiers: form.tiers.map((t) => ({ up_to_kwh: t.up == null ? null : Number(t.up), adder: Number(t.adder || 0) })),
+    };
+    try {
+      const r = await fetch('/api/tariff', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      if (!r.ok) throw new Error((await r.json()).error || r.statusText);
+      onSaved();
+      onClose();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+  return html`<dialog class="dialog" ref=${ref} onClose=${onClose} aria-labelledby="tariff-title">
+    <form method="dialog" onSubmit=${save}>
+      <h2 id="tariff-title">Tariff and billing cycle</h2>
+      ${!form ? html`<p class="empty">${error || 'Loading'}</p>` : html`
+      <label class="field"><span>Billing cycle starts on day</span>
+        <input type="number" min="1" max="31" step="1" required value=${form.day} onInput=${(e) => set({ day: e.target.value })} />
+        <small>Of each month. Days past the end of a short month use its last day.</small></label>
+      <fieldset>
+        <legend>Rate per kWh, by time of use</legend>
+        <div class="rate-grid">
+          ${PERIOD_FIELDS.map(([k, label]) => html`<label class="field"><span>${label}</span>
+            <span class="input-unit"><span aria-hidden="true">$</span><input type="number" min="0" max="10" step="0.00001" inputmode="decimal" required
+              value=${form.rates[k]} onInput=${(e) => set({ rates: { ...form.rates, [k]: e.target.value } })} /></span></label>`)}
+        </div>
+        <small>Super off-peak and on-peak hours come from the planner calendar; every other hour is off-peak.</small>
+      </fieldset>
+      <fieldset>
+        <legend>Usage tiers</legend>
+        <small>Optional. An amount per kWh added to the time-of-use rate, chosen by how much you have imported so far this cycle. Use a negative amount for a baseline credit.</small>
+        ${form.tiers.length ? html`<table class="tier-table">
+          <thead><tr><th scope="col">Tier</th><th scope="col">Cycle import</th><th scope="col">Added per kWh</th><th><span class="vh">Remove</span></th></tr></thead>
+          <tbody>${form.tiers.map((t, i) => {
+            const from = i === 0 ? '0' : (form.tiers[i - 1].up || '…');
+            return html`<tr>
+              <td>${i + 1}</td>
+              <td>${t.up == null ? html`<span class="muted">${`above ${from} kWh`}</span>` : html`<span class="input-unit">
+                <input type="number" min="0" step="any" required aria-label=${`Tier ${i + 1} upper limit`} value=${t.up}
+                  onInput=${(e) => setTier(i, { up: e.target.value })} /><span aria-hidden="true">kWh</span></span>`}</td>
+              <td><span class="input-unit"><span aria-hidden="true">$</span><input type="number" min="-10" max="10" step="0.00001" required
+                aria-label=${`Tier ${i + 1} amount per kWh`} value=${t.adder} onInput=${(e) => setTier(i, { adder: e.target.value })} /></span></td>
+              <td><button type="button" class="link" onClick=${() => removeTier(i)}>Remove</button></td>
+            </tr>`;
+          })}</tbody>
+        </table>` : null}
+        ${form.tiers.length < 6 ? html`<button type="button" class="link" onClick=${addTier}>Add a tier</button>` : null}
+      </fieldset>
+      ${error ? html`<p class="error-text" role="alert">${error}</p>` : null}`}
+      <div class="dialog-actions">
+        <button type="button" class="btn" onClick=${onClose}>Cancel</button>
+        <button type="submit" class="btn btn-primary" disabled=${!form || busy}>Save</button>
+      </div>
+    </form>
+  </dialog>`;
+}
+
 // ---------- hero: state of charge across the tariff day ----------------------------------------
 const PERIOD = { super_off_peak: 'Super off-peak', on_peak: 'On-peak', off_peak: 'Off-peak' };
 const periodAt = (bands, t) => (bands.find((b) => t >= b.start && t < b.end) || { kind: 'off_peak' }).kind;
 
 function decisionSentence(pl) {
   const p = pl.plan || {};
+  const m = pl.manual;
+  if (m) {
+    const by = hhmm(m.until);
+    if (m.mode === 'time') return `Manual charge from the grid until ${by}.`;
+    return `Manual charge to ${m.target_soc} %${m.eta ? `, expected at ${hhmm(isoTs(m.eta))}` : ''}. It stops by ${by} at the latest.`;
+  }
   if (!pl.enabled) return 'The planner is off, so the inverter follows its own settings.';
   if (p.action === 'stale') return 'No fresh inverter data, so the planner is not changing anything.';
   if (p.action === 'waiting') return 'The planner is waiting for the clock to synchronise.';
@@ -990,6 +1164,69 @@ function DailyEnergy() {
 }
 
 // ---------- planner ---------------------------------------------------------------------------------
+const SOC_PRESETS = [50, 80, 90, 100];
+const TIME_PRESETS = [[15, '15 min'], [30, '30 min'], [60, '1 h'], [120, '2 h'], [180, '3 h']];
+
+function ManualCharge({ s }) {
+  const pl = s.planner;
+  const m = pl.manual;
+  const socNow = s.jk?.data?.soc ?? s.inverter?.data?.soc;
+  const [mode, setMode] = useState('soc');
+  const [target, setTarget] = useState(80);
+  const [minutes, setMinutes] = useState(60);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const period = periodAt(pl.tariff || [], s.ts);
+  async function send(method, body) {
+    setBusy(true);
+    setError('');
+    try {
+      const r = await fetch('/api/charge', { method, headers: { 'Content-Type': 'application/json' }, body: body && JSON.stringify(body) });
+      if (!r.ok) throw new Error((await r.json()).error || r.statusText);
+    } catch (err) {
+      setError(`${method === 'DELETE' ? 'The charge could not be stopped' : 'The charge could not start'}: ${err.message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+  if (m) {
+    const text = m.mode === 'time'
+      ? `Charging from the grid until ${hhmm(m.until)}, started at ${hhmm(m.started)} from ${num(m.start_soc)} %.`
+      : `Charging to ${m.target_soc} %${m.eta ? `, expected at ${hhmm(isoTs(m.eta))}` : ''}. Stops by ${hhmm(m.until)} at the latest.`;
+    return html`<div class="manual">
+      <h3>Manual charge</h3>
+      <p class="bridge-status st-ok"><${Icon} kind="ok" /><span>${text}</span></p>
+      <button class="btn" disabled=${busy} onClick=${() => send('DELETE')}>Stop the charge</button>
+      ${error ? html`<p class="error-text" role="alert">${error}</p>` : null}
+    </div>`;
+  }
+  const low = socNow != null && mode === 'soc' && target <= socNow;
+  return html`<div class="manual">
+    <h3>Manual charge</h3>
+    <div class="filters" role="radiogroup" aria-label="Charge until">
+      <button role="radio" aria-checked=${mode === 'soc'} onClick=${() => setMode('soc')}>To a state of charge</button>
+      <button role="radio" aria-checked=${mode === 'time'} onClick=${() => setMode('time')}>For a set time</button>
+    </div>
+    ${mode === 'soc' ? html`<div class="manual-row">
+      <label class="field inline"><span>Target</span><span class="input-unit"><input type="number" min="5" max="100" step="1"
+        value=${target} onInput=${(e) => setTarget(Number(e.target.value))} /><span aria-hidden="true">%</span></span></label>
+      <div class="filters" role="radiogroup" aria-label="Target presets">
+        ${SOC_PRESETS.map((v) => html`<button role="radio" aria-checked=${target === v} onClick=${() => setTarget(v)}>${`${v} %`}</button>`)}
+      </div>
+    </div>` : html`<div class="manual-row">
+      <div class="filters" role="radiogroup" aria-label="Duration">
+        ${TIME_PRESETS.map(([v, label]) => html`<button role="radio" aria-checked=${minutes === v} onClick=${() => setMinutes(v)}>${label}</button>`)}
+      </div>
+    </div>`}
+    <p class="manual-note">${socNow != null ? `The battery is at ${num(socNow)} % now. ` : ''}${low ? 'Pick a target above that. ' : ''}${
+      period !== 'super_off_peak' ? `It is ${PERIOD[period].toLowerCase()} now, so this charge is billed at the ${PERIOD[period].toLowerCase()} rate. ` : ''}${
+      pl.enabled ? 'The planner resumes when the charge ends.' : 'The planner is off; the charge still runs and stops by itself.'}</p>
+    <button class="btn btn-primary" disabled=${busy || low || socNow == null}
+      onClick=${() => send('POST', mode === 'soc' ? { mode, target_soc: target } : { mode, minutes })}>Start charging</button>
+    ${error ? html`<p class="error-text" role="alert">${error}</p>` : null}
+  </div>`;
+}
+
 function PlannerPanel({ s }) {
   const pl = s.planner;
   const [busy, setBusy] = useState(false);
@@ -1020,6 +1257,8 @@ function PlannerPanel({ s }) {
     <span class="track"><span class="knob"></span></span>${pl.enabled ? 'On' : 'Off'}${pl.dry_run ? ', dry run' : ''}</button>`;
   return html`<${Panel} id="plan-title" title="Charge planner" className="planner" aside=${aside}>
     ${error ? html`<p class="error-text" role="alert">${error}</p>` : null}
+    <${ManualCharge} s=${s} />
+    <h3>Plan</h3>
     <${Facts} rows=${[
       ['Decision', p.reason],
       ['Tariff window', p.in_sop ? `Super off-peak until ${hhmm(isoTs(p.window_end))}` : `Next super off-peak ${dayHhmm(isoTs(p.next_window))}`],
@@ -1126,12 +1365,16 @@ function Events({ events }) {
 // ---------- app ----------------------------------------------------------------------------------------
 function App() {
   const { state: s, connected, events, lastRx } = useLive();
+  const [settings, setSettings] = useState(false);
+  const [summaryKey, setSummaryKey] = useState(0);
+  const [summary] = usePoll(`/api/summary?k=${summaryKey}`, 60000);
   if (!s) return html`<p class="boot">Connecting to solar01</p>`;
   TZ = s.tz;
   return html`
     <${Header} s=${s} connected=${connected} lastRx=${lastRx} />
     <main class="page">
       ${s.simulate ? html`<p class="banner">Simulated devices: these readings do not come from the inverter or the battery.</p>` : null}
+      <${Headline} s=${s} summary=${summary} onSettings=${() => setSettings(true)} />
       <${DayStrip} s=${s} />
       <div class="row-now">
         <div class="stack"><${PowerFlow} s=${s} /><${CtPanel} s=${s} /></div>
@@ -1145,7 +1388,8 @@ function App() {
         <${SystemPanel} s=${s} />
       </div>
       <${Events} events=${events} />
-    </main>`;
+    </main>
+    <${TariffDialog} open=${settings} onClose=${() => setSettings(false)} onSaved=${() => setSummaryKey((k) => k + 1)} />`;
 }
 
 const root = document.getElementById('app');

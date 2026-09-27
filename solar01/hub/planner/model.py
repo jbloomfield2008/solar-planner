@@ -14,6 +14,8 @@ Decision rules, in order, inside a super-off-peak (SOP) window:
    skipped if it would make PV clip later.
 3. If no hold is enough: the longest possible hold, then the smallest quick-charge
    target started as late as possible; standby ends window_exit_lead_min before it.
+   Already below the reserve: the charge starts now, and the smallest target that keeps
+   SOC above the reserve from the stop time to the horizon is chosen.
 
 Every hold and charge ends window_exit_lead_min before the window closes (the stop time),
 because the inverter needs minutes to return to normal; in those last minutes nothing
@@ -216,7 +218,11 @@ def decide(p, cal, now, soc, batt_kwh, load_fn, pv_fn, charge_kw, currently_on, 
 
     if hold_possible and clipped_with(now, hold_end) < p.hold_clip_kwh:
         hold_from, hold_until = now, hold_end
-    jit = not currently_on
+    # Already below the reserve: no target can keep the whole run above it, because it starts below.  Charge now
+    # (no late start that would let it sink further) and judge a target by the SOC from the stop time to the horizon,
+    # which is what the charge controls.  Without this every target failed and the charge went to max_soc.
+    below = soc < p.reserve_soc
+    jit = not currently_on and not below
     rate = max(min(charge_kw, cap), 0.3)
 
     def schedule(L):
@@ -232,8 +238,11 @@ def decide(p, cal, now, soc, batt_kwh, load_fn, pv_fn, charge_kw, currently_on, 
                     break
                 start = nxt
                 kwh, hours = need(start)
+        log = []
         m = sim(charge_to=L, charge_kw=charge_kw, we=stop_at, hold_from=hold_from, hold_until=hold_until,
-                charge_from=start)[0]
+                charge_from=start, soc_log=log)[0]
+        if below:
+            m = min((v for t, v in log if t > stop_at), default=m)
         return kwh, hours, start, m
 
     target = None

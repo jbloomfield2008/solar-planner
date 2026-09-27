@@ -217,6 +217,19 @@ class DecideTest(unittest.TestCase):
                    chg_cap_kw=2.1)
         self.assertEqual((a['start_at'], a['hours_needed']), (b['start_at'], b['hours_needed']))
 
+    def test_below_reserve_charges_to_what_is_needed(self):
+        """Starting a window below the reserve used to fail every target and charge to max_soc (seen 2026-09-27:
+        a charge to 100 % planned overnight ahead of a 13.9 kWh solar day)."""
+        now = D(2026, 9, 28, 0)
+        above = decide(now, 21, load_fn, pv_sunny, 3.0, currently_on=False)
+        for soc in (5, 16, 19):
+            p = decide(now, soc, load_fn, pv_sunny, 3.0, currently_on=False)
+            self.assertEqual((p['action'], p['start_at']), ('on', now.isoformat(timespec='minutes')), 'charge now')
+            self.assertEqual(p['target_soc'], above['target_soc'], soc)
+            self.assertNotIn('warning', p)
+            after = [v for t, v in p['projection'] if t > dt.datetime.fromisoformat(p['actions_stop']).timestamp()]
+            self.assertGreaterEqual(min(after), P.reserve_soc - 1)
+
 
 def hour_ts(y, m, d, hh):
     return int(D(y, m, d, hh).timestamp())

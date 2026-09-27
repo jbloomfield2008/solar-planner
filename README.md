@@ -160,8 +160,11 @@ word of 0 shows "Forbidden" on the LCD. It polls only when the battery type is L
 are negative. Frames with the wrong cell count or implausible values are dropped because the emulator
 forwards them to the inverter.
 
-**Planner** - see the docstring in `solar01/hub/planner/model.py`. Holds and grid charges are only used
-to close a forecast shortfall and are scheduled as late in the window as possible; every hold and charge
+**Planner** - see the docstring in `solar01/hub/planner/model.py`. The battery may dip below the 20 %
+reserve; the planner acts only if the forecast would take it below the 15 % floor (`floor_soc`) before the next
+super off-peak window, sizes what it does to keep the reserve, and never grid-charges outside a window. Outside
+the windows a battery at the floor is held in standby while PV cannot carry the house, until the next window
+(decided 2026-09-27). Holds and grid charges are only used to close a forecast shortfall and are scheduled as late in the window as possible; every hold and charge
 ends 10 min before the window closes, because the inverter takes about 5 minutes to return to normal after
 standby or a quick charge; the projection covers 24 hours, previewing what later windows would decide; SOC comes from the BMS; the charge rate is capped by H101 and the emulator's
 limit. Margins set by the user: load 1.05, PV 0.9.

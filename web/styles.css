@@ -325,3 +325,4 @@ legend { font: 600 15.5px/1.3 var(--cond); padding: 0 6px 0 0; }
 .manual .bridge-status { margin-bottom: 0; }
 .manual-row { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; }
 .manual-note { color: var(--ink-2); font-size: 13.5px; max-width: 60ch; }
+.floor { stroke: var(--critical); stroke-width: 1; stroke-dasharray: 2 3; }

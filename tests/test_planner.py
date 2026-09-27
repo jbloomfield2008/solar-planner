@@ -224,11 +224,40 @@ class DecideTest(unittest.TestCase):
         above = decide(now, 21, load_fn, pv_sunny, 3.0, currently_on=False)
         for soc in (5, 16, 19):
             p = decide(now, soc, load_fn, pv_sunny, 3.0, currently_on=False)
-            self.assertEqual((p['action'], p['start_at']), ('on', now.isoformat(timespec='minutes')), 'charge now')
             self.assertEqual(p['target_soc'], above['target_soc'], soc)
             self.assertNotIn('warning', p)
-            after = [v for t, v in p['projection'] if t > dt.datetime.fromisoformat(p['actions_stop']).timestamp()]
-            self.assertGreaterEqual(min(after), P.reserve_soc - 1)
+            self.assertEqual(p['hold_start'], now.isoformat(timespec='minutes'), 'standby until the late start')
+            stop = dt.datetime.fromisoformat(p['actions_stop']).timestamp()
+            self.assertGreaterEqual(min(v for t, v in p['projection'] if t > stop), P.reserve_soc - 1)
+            self.assertGreaterEqual(min(v for _, v in p['projection']), min(soc, P.floor_soc) - 1, 'never sinks meanwhile')
+
+    def test_floor(self):
+        """Dips below the reserve are left to the next window; the floor is held with standby outside super off-peak."""
+        # in a window: forecast dips below the 20 % reserve but stays above the 15 % floor -> nothing to do
+        p = decide(D(2026, 9, 28, 0), 52, load_fn, pv_sunny, 3.0, currently_on=False, hold_enabled=False)
+        self.assertTrue(P.floor_soc <= p['forecast_min_soc'] < P.reserve_soc, p['forecast_min_soc'])
+        self.assertEqual((p['action'], p['target_soc']), ('off', None))
+        # outside a window at the floor, at night: standby until the next window, no charge
+        p = decide(D(2026, 9, 28, 22), 15, load_fn, pv_sunny, 3.0, currently_on=False)
+        self.assertEqual((p['action'], p['hold'], p['floor_hold']), ('off', True, True))
+        self.assertEqual(p['hold_end'], D(2026, 9, 29, 0).isoformat(timespec='minutes'))
+        self.assertEqual(decide(D(2026, 9, 28, 22), 16.5, load_fn, pv_sunny, 3.0, False, currently_holding=True)['hold'],
+                         True, 'kept within the hysteresis while in standby')
+        self.assertFalse(decide(D(2026, 9, 28, 22), 16.5, load_fn, pv_sunny, 3.0, False)['hold'])
+        # weekday morning between windows: until solar covers the house or the 10:00 window
+        p = decide(D(2026, 9, 29, 7), 15, load_fn, pv_sunny, 3.0, currently_on=False)
+        self.assertEqual(p['hold_end'], D(2026, 9, 29, 10).isoformat(timespec='minutes'))
+        # sunny afternoon: solar carries the house, so no standby
+        self.assertFalse(decide(D(2026, 9, 28, 15), 15, load_fn, pv_sunny, 3.0, currently_on=False)['hold'])
+        # the evening projection flattens at the floor and shows the expected standby
+        now = D(2026, 9, 27, 16)
+        plan = decide(now, 56, load_fn, pv_sunny, 3.0, currently_on=False)
+        self.assertGreaterEqual(min(v for _, v in plan['projection']), P.floor_soc - 0.5)
+        r = model.rolling_projection(P, CAL, now, 56, KWH, load_fn, pv_sunny, 3.0, plan)
+        floor = [a for a in r['actions'] if a.get('floor')]
+        self.assertTrue(floor and floor[0]['end'] == D(2026, 9, 28, 0).isoformat(timespec='minutes'), r['actions'])
+        charge = next(a for a in r['actions'] if a['kind'] == 'charge')
+        self.assertLess(charge['target'], 60, 'the overnight charge is sized, not 100 %')
 
 
 def hour_ts(y, m, d, hh):

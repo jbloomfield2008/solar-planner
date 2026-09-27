@@ -93,7 +93,9 @@ class PlannerConfig:
     weekend_sop: str = '0-14'
     on_peak: str = '16-21'               # display only: the planner itself only needs super-off-peak
     extra_holidays: list[str] = dc.field(default_factory=list)
-    reserve_soc: float = 20.0
+    reserve_soc: float = 20.0            # a needed hold or charge is sized to keep SOC above this until the next window
+    floor_soc: float = 15.0              # hard floor: the planner acts only if SOC would fall below it; outside super
+                                         # off-peak it holds standby at the floor (grid feeds the house) until the next window
     max_soc: float = 100.0
     batt_kwh: float = 0.0                # 0 = JK capacity (Ah) x nominal_v
     nominal_v: float = 51.2

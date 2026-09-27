@@ -360,6 +360,9 @@ function decisionSentence(pl) {
   if (p.window_closing) {
     return `Super off-peak ends at ${hhmm(isoTs(p.window_end))}. Holds and charges stopped at ${hhmm(isoTs(p.actions_stop))} so the inverter is back to normal in time.`;
   }
+  if (p.floor_hold) {
+    return `The battery is at the ${p.floor_soc} % floor. Standby until ${hhmm(isoTs(p.hold_end))}: the grid carries the house, and nothing charges until super off-peak.`;
+  }
   if (p.hold_start) {
     return p.hold
       ? `Standby hold until ${hhmm(isoTs(p.hold_end))}: the grid carries the house so the battery lasts.`
@@ -369,8 +372,12 @@ function decisionSentence(pl) {
     const next = (p.actions || []).find((a) => a.preview);
     let then = ' No hold or charge is expected in the next 24 hours.';
     if (next && next.kind === 'hold') then = ` The forecast points to a standby hold from ${dayHhmm(isoTs(next.start))} to ${hhmm(isoTs(next.end))}.`;
+    if (next && next.kind === 'hold' && next.floor) then = ` The battery is expected to reach the ${p.floor_soc} % floor at ${dayHhmm(isoTs(next.start))}; the grid then carries the house until ${hhmm(isoTs(next.end))}.`;
     if (next && next.kind === 'charge') then = ` The forecast points to a grid charge to ${next.target} % from ${dayHhmm(isoTs(next.start))}.`;
     return `Nothing to do until super off-peak starts at ${dayHhmm(isoTs(p.next_window))}.${then}`;
+  }
+  if (p.forecast_min_soc != null && p.floor_soc != null && p.forecast_min_soc < p.reserve_soc) {
+    return `No grid charge or standby hold needed. The battery dips to about ${p.forecast_min_soc} %, above the ${p.floor_soc} % floor.`;
   }
   return `No grid charge or standby hold needed. The battery stays above the ${p.reserve_soc} % reserve.`;
 }
@@ -385,6 +392,7 @@ function DayStrip({ s }) {
   const now = s.ts;
   const socNow = s.jk?.data?.soc ?? s.inverter?.data?.soc;
   const reserve = plan.reserve_soc ?? 20;
+  const floor = plan.floor_soc;
   const bands = pl.tariff || [];
   const measured = useMemo(() => {
     if (!hist?.t) return [];
@@ -406,7 +414,7 @@ function DayStrip({ s }) {
     </div>
     <div class="strip-plot" ref=${ref}>
       ${width ? html`<${StripChart} width=${width} now=${now} bands=${bands} measured=${measured} projection=${projection}
-        plan=${plan} reserve=${reserve} socNow=${socNow} low=${low} hover=${hover} setHover=${setHover} />` : null}
+        plan=${plan} reserve=${reserve} floor=${floor} socNow=${socNow} low=${low} hover=${hover} setHover=${setHover} />` : null}
     </div>
     <div class="strip-foot">
       <div class="strip-legend" aria-label="Legend">
@@ -442,7 +450,7 @@ function interpolate(series, t) {
   return Math.abs(near[0] - t) <= 1800 ? near[1] : null;
 }
 
-function StripChart({ width, now, bands, measured, projection, plan, reserve, socNow, low, hover, setHover }) {
+function StripChart({ width, now, bands, measured, projection, plan, reserve, floor, socNow, low, hover, setHover }) {
   const W = Math.max(width, 300);
   const H = 232;
   const L = 44;
@@ -530,6 +538,10 @@ function StripChart({ width, now, bands, measured, projection, plan, reserve, so
       </g>`)}
       <line class="reserve" x1=${L} x2=${W - R} y1=${y(reserve)} y2=${y(reserve)} />
       <text class="tick" x=${W - R - 4} y=${y(reserve) - 5} text-anchor="end">${`Reserve ${reserve} %`}</text>
+      ${floor != null && floor < reserve ? html`<g>
+        <line class="floor" x1=${L} x2=${W - R} y1=${y(floor)} y2=${y(floor)} />
+        <text class="tick" x=${W - R - 4} y=${y(floor) + 13} text-anchor="end">${`Floor ${floor} %`}</text>
+      </g>` : null}
       ${shown.length > 1 ? html`<path class="soc-measured" d=${path(shown)} />` : null}
       ${planned.length > 1 ? html`<path class="soc-planned" d=${path(planned)} />` : null}
       ${planEnd && planEnd[0] < t1 - 3600 && !narrow && !lowIsEnd ? html`<text class="point-label" x=${Math.min(x(planEnd[0]) + 8, W - R - 150)} y=${Math.max(TOP + 14, y(planEnd[1]) - 10)}>Projection ends here</text>` : null}

@@ -8,14 +8,23 @@ computed with the capped rate.
 Decision rules, in order, inside a super-off-peak (SOP) window:
 
 1. Simulate to the start of the next SOP window with no hold and no grid charge.
-   If SOC stays above the reserve: do nothing.
+   If SOC stays at or above the floor (floor_soc): do nothing.  Dipping below the
+   reserve is fine; the next window deals with it.  Holds and charges that are needed
+   are sized to keep the reserve (reserve_soc), a buffer above the floor.
 2. Otherwise find the shortest standby hold that closes the shortfall, ending as late
    as possible: at the stop time or when PV is expected, whichever is first.  Holding is
    skipped if it would make PV clip later.
 3. If no hold is enough: the longest possible hold, then the smallest quick-charge
    target started as late as possible; standby ends window_exit_lead_min before it.
-   Already below the reserve: the charge starts now, and the smallest target that keeps
-   SOC above the reserve from the stop time to the horizon is chosen.
+   Already below the reserve: a target is judged by the SOC from the stop time to the
+   horizon, and a late start only if the wait keeps SOC above the floor (else it starts now).
+   If no target keeps the reserve, the smallest that keeps the floor; if none, max_soc.
+
+Outside SOP nothing is ever charged from the grid.  If SOC reaches the floor while PV cannot
+carry the house, the inverter holds standby (the grid feeds the loads, the battery rests) until
+the next SOP window starts or PV is expected to cover the load (floor_hold()).  Simulations of
+the time between windows model the same floor standby (``floor_soc``), so projections flatten
+at the floor instead of running below it.
 
 Every hold and charge ends window_exit_lead_min before the window closes (the stop time),
 because the inverter needs minutes to return to normal; in those last minutes nothing
@@ -31,15 +40,19 @@ import math
 
 
 def simulate(p, t0, soc0, horizon, batt_kwh, load_fn, pv_fn, charge_to=None, charge_kw=0.0, we=None,
-             hold_until=None, charge_from=None, soc_log=None, hold_from=None, chg_cap_kw=None):
+             hold_until=None, charge_from=None, soc_log=None, hold_from=None, chg_cap_kw=None, floor_soc=None,
+             floor_log=None):
     """Step SOC forward in p.sim_step_s steps.
 
     hold_from/hold_until: while inside and PV < load, the inverter is in standby (grid feeds
     the loads, battery untouched).  charge_from: grid charging (to charge_to, inside the
     window ending at we) starts no earlier than this.  soc_log receives (step end, soc).
+    floor_soc: the battery never discharges below it; at the floor with PV < load the inverter holds standby
+    (floor standby, outside SOP).  floor_log receives the start of each step that ends at the floor.
     Returns (min_soc, trace[(label, load_kw, pv_kw, soc)], clipped_kwh, final_soc)."""
     cap = p.pv_chg_max_kw if chg_cap_kw is None else chg_cap_kw
     e = soc0 / 100 * batt_kwh
+    floor_e = None if floor_soc is None else min(floor_soc, soc0) / 100 * batt_kwh
     min_soc = soc0
     trace = []
     clipped = 0.0
@@ -67,6 +80,10 @@ def simulate(p, t0, soc0, horizon, batt_kwh, load_fn, pv_fn, charge_to=None, cha
                 pass                                                            # standby: grid feeds loads
             else:
                 e -= min(-net, p.dis_max_kw) / p.dis_eff * rest
+                if floor_e is not None and e <= floor_e:
+                    e = floor_e                                                 # floor standby
+                    if floor_log is not None:
+                        floor_log.append(t)
         if e > batt_kwh:
             clipped += e - batt_kwh
             e = batt_kwh
@@ -91,6 +108,38 @@ def _min_at(now, soc, log, min_soc):
     return min(log, key=lambda r: r[1])[0].isoformat(timespec='minutes')
 
 
+def _periods(starts, step, until) -> list[tuple]:
+    """Contiguous (start, end) runs from a list of step start times, ending no later than until."""
+    out: list[list] = []
+    for t in starts:
+        if out and t <= out[-1][1]:
+            out[-1][1] = t + step
+        else:
+            out.append([t, t + step])
+    return [(a, min(b, until)) for a, b in out if a < until]
+
+
+def floor_hold(p, now, until, soc, load_fn, pv_fn, pv_now_w=None, currently_holding=False):
+    """Outside SOP: end of the floor standby to hold now, or None.  At the floor (kept while already in standby,
+    within hyst_soc) and while PV cannot carry the house, standby until `until` (the next window start) or until PV
+    is expected to cover the load, whichever is first."""
+    if soc > p.floor_soc + (p.hyst_soc if currently_holding else 0.0):
+        return None
+
+    def short(t):
+        return pv_fn(t) * p.pv_margin < load_fn(t) * p.load_margin
+    if not (short(now) and short(now + dt.timedelta(minutes=30))):
+        return None
+    if pv_now_w is not None and pv_now_w * p.pv_margin >= load_fn(now) * p.load_margin:
+        return None
+    step = dt.timedelta(seconds=p.sim_step_s)
+    end = now
+    while end < until and short(end):
+        end += step
+    end = min(end, until)
+    return end if end - now >= step else None
+
+
 def decide(p, cal, now, soc, batt_kwh, load_fn, pv_fn, charge_kw, currently_on, hold_enabled=None,
            pv_now_w=None, currently_holding=False, chg_cap_kw=None):
     """Plan dict for this tick.  pv_now_w: measured PV (None while in standby).
@@ -98,18 +147,30 @@ def decide(p, cal, now, soc, batt_kwh, load_fn, pv_fn, charge_kw, currently_on, 
     if hold_enabled is None:
         hold_enabled = p.hold_enabled
     cap = p.pv_chg_max_kw if chg_cap_kw is None else chg_cap_kw
-    plan = {'soc': soc, 'reserve_soc': p.reserve_soc, 'batt_kwh': round(batt_kwh, 2), 'charge_kw': round(charge_kw, 2),
+    plan = {'soc': soc, 'reserve_soc': p.reserve_soc, 'floor_soc': p.floor_soc, 'batt_kwh': round(batt_kwh, 2),
+            'charge_kw': round(charge_kw, 2),
             'chg_cap_kw': round(cap, 2), 'hold': False}
     win = cal.current_window(now)
     if win is None:
         nw = cal.next_window_start(now)
         plan.update(action='off', in_sop=False, reason='not super off-peak', next_window=nw.isoformat(timespec='minutes'),
                     target_soc=None, grid_kwh=0.0)
-        log = []
-        min_soc, trace, _, final = simulate(p, now, soc, nw, batt_kwh, load_fn, pv_fn, chg_cap_kw=cap, soc_log=log)
+        log, flog = [], []
+        min_soc, trace, _, final = simulate(p, now, soc, nw, batt_kwh, load_fn, pv_fn, chg_cap_kw=cap, soc_log=log,
+                                            floor_soc=p.floor_soc, floor_log=flog)
         plan.update(forecast_min_soc=round(min_soc), projected_min_soc=round(min_soc), projected_soc_window_end=None,
                     projected_soc_next_window=round(final), trace=trace[:36],
                     projected_min_at=_min_at(now, soc, log, min_soc), projection=_projection(now, soc, log))
+        end = floor_hold(p, now, nw, soc, load_fn, pv_fn, pv_now_w, currently_holding)
+        if end is not None:
+            plan.update(hold=True, floor_hold=True, hold_start=now.isoformat(timespec='minutes'),
+                        hold_end=end.isoformat(timespec='minutes'),
+                        reason=f'battery at the {p.floor_soc:.0f}% floor: standby until {end:%H:%M}, the grid carries '
+                               f'the house' + (' until super off-peak' if end >= nw else ' until solar covers it'))
+        else:
+            # floor standby the projection expects later, before the next window (shown as forecast holds)
+            plan['floor_holds'] = [[a.isoformat(timespec='minutes'), b.isoformat(timespec='minutes')]
+                                   for a, b in _periods(flog, dt.timedelta(seconds=p.sim_step_s), nw)]
         return plan
     ws, we = win
     lead = dt.timedelta(minutes=p.window_exit_lead_min)
@@ -186,9 +247,10 @@ def decide(p, cal, now, soc, batt_kwh, load_fn, pv_fn, charge_kw, currently_on, 
         return plan
 
     hyst = p.hyst_soc if (currently_on or currently_holding) else 0
-    if min_soc0 >= p.reserve_soc + hyst:
+    if min_soc0 >= p.floor_soc + hyst:
         plan.update(action='off', target_soc=None, grid_kwh=0.0,
-                    reason=f'no hold or grid charge needed: forecast min SOC {min_soc0:.0f}% >= reserve {p.reserve_soc:.0f}%')
+                    reason=f'no hold or grid charge needed: forecast min SOC {min_soc0:.0f}% stays above the '
+                           f'{p.floor_soc:.0f}% floor')
         project()
         return plan
 
@@ -218,14 +280,13 @@ def decide(p, cal, now, soc, batt_kwh, load_fn, pv_fn, charge_kw, currently_on, 
 
     if hold_possible and clipped_with(now, hold_end) < p.hold_clip_kwh:
         hold_from, hold_until = now, hold_end
-    # Already below the reserve: no target can keep the whole run above it, because it starts below.  Charge now
-    # (no late start that would let it sink further) and judge a target by the SOC from the stop time to the horizon,
-    # which is what the charge controls.  Without this every target failed and the charge went to max_soc.
-    below = soc < p.reserve_soc
-    jit = not currently_on and not below
+    # Already below the reserve: no target can keep the whole run above it, because it starts below.  Judge a target by
+    # the SOC from the stop time to the horizon (what the charge controls), provided the wait before a late start does
+    # not take SOC below the floor or further below where it is now (at night the standby hold keeps it flat).
+    # If no late start manages that, charge now.  Without this every target failed and the charge went to max_soc.
     rate = max(min(charge_kw, cap), 0.3)
 
-    def schedule(L):
+    def schedule(L, jit, level):
         def need(start):
             kwh = max(0.0, (L - max(soc, soc_no_charge_at(start))) / 100 * batt_kwh) / p.chg_eff
             return kwh, kwh / rate
@@ -241,20 +302,31 @@ def decide(p, cal, now, soc, batt_kwh, load_fn, pv_fn, charge_kw, currently_on, 
         log = []
         m = sim(charge_to=L, charge_kw=charge_kw, we=stop_at, hold_from=hold_from, hold_until=hold_until,
                 charge_from=start, soc_log=log)[0]
-        if below:
-            m = min((v for t, v in log if t > stop_at), default=m)
-        return kwh, hours, start, m
+        if soc >= level:
+            return kwh, hours, start, m, m >= level
+        after = min((v for t, v in log if t > stop_at), default=m)
+        return kwh, hours, start, after, after >= level and m >= min(p.floor_soc, soc) - 1.0
 
+    # the smallest target that keeps the reserve; if none can, the smallest that keeps the floor
     target = None
-    for L in range(int(math.ceil(soc)) + 1, int(p.max_soc) + 1):
-        grid_kwh, hours_needed, start_at, m = schedule(L)
-        if m >= p.reserve_soc:
-            target = L
+    for level in (p.reserve_soc, p.floor_soc):
+        for jit in ((True, False) if soc < level and not currently_on else (not currently_on,)):
+            for L in range(int(math.ceil(soc)) + 1, int(p.max_soc) + 1):
+                grid_kwh, hours_needed, start_at, m, ok = schedule(L, jit, level)
+                if ok:
+                    target = L
+                    break
+            if target is not None:
+                break
+        if target is not None:
+            if level < p.reserve_soc:
+                plan['warning'] = (f'no charge keeps the {p.reserve_soc:.0f}% reserve until the next window; '
+                                   f'charging to {target}% keeps the {p.floor_soc:.0f}% floor')
             break
     if target is None:
         target = int(p.max_soc)
-        grid_kwh, hours_needed, start_at, m = schedule(target)
-        plan['warning'] = f'even charging to {target}% forecasts min SOC {m:.0f}% < reserve'
+        grid_kwh, hours_needed, start_at, m, _ok = schedule(target, not currently_on, p.floor_soc)
+        plan['warning'] = f'even charging to {target}% forecasts min SOC {m:.0f}% < floor'
     plan.update(target_soc=target, grid_kwh=round(grid_kwh, 2), hours_needed=round(hours_needed, 2),
                 start_at=start_at.isoformat(timespec='minutes'), charge_end=stop_at.isoformat(timespec='minutes'))
     hold_note = ''
@@ -284,7 +356,10 @@ def decide(p, cal, now, soc, batt_kwh, load_fn, pv_fn, charge_kw, currently_on, 
 def plan_actions(plan: dict, preview: bool) -> list[dict]:
     out = []
     if plan.get('hold_start') and plan.get('hold_end'):
-        out.append({'kind': 'hold', 'start': plan['hold_start'], 'end': plan['hold_end'], 'preview': preview})
+        out.append({'kind': 'hold', 'start': plan['hold_start'], 'end': plan['hold_end'], 'preview': preview,
+                    'floor': bool(plan.get('floor_hold'))})
+    for a, b in plan.get('floor_holds') or []:
+        out.append({'kind': 'hold', 'start': a, 'end': b, 'preview': True, 'floor': True})
     if plan.get('target_soc') is not None and plan.get('start_at') and plan.get('charge_end'):
         out.append({'kind': 'charge', 'start': plan['start_at'], 'end': plan['charge_end'],
                     'target': plan['target_soc'], 'preview': preview})
@@ -329,10 +404,13 @@ def rolling_projection(p, cal, now, soc, batt_kwh, load_fn, pv_fn, charge_kw, pl
         if cal.current_window(t) is None:
             nxt = cal.next_window_start(t)
             seg_end = min(nxt, end) if nxt else end
-            log = []
-            simulate(p, t, last_soc, seg_end, batt_kwh, load_fn, pv_fn, chg_cap_kw=chg_cap_kw, soc_log=log)
+            log, flog = [], []
+            simulate(p, t, last_soc, seg_end, batt_kwh, load_fn, pv_fn, chg_cap_kw=chg_cap_kw, soc_log=log,
+                     floor_soc=p.floor_soc, floor_log=flog)
             if not log:
                 break
+            actions.extend({'kind': 'hold', 'start': a.isoformat(timespec='minutes'), 'end': b.isoformat(timespec='minutes'),
+                            'preview': True, 'floor': True} for a, b in _periods(flog, dt.timedelta(seconds=p.sim_step_s), seg_end))
             points.extend([round(ts.timestamp()), round(v, 1)] for ts, v in log)
             points = cut(points, seg_end.timestamp())
             continue

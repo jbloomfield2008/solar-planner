@@ -1,0 +1,37 @@
+# /etc/solar01/config.toml  (root:solar01, mode 0640 - it holds the MQTT password)
+#
+# Only values that differ from the built-in defaults are needed.  Every default lives in
+# solar01/config.py with a comment; unknown keys are rejected at startup.
+# Check the effective configuration with:
+#   PYTHONPATH=/opt/solar01/current python3 -m solar01 --config /etc/solar01/config.toml check-config
+
+log_level = "INFO"
+
+[core.inverter]
+# Dynamic CT calibration (H119, LSB 0.1 W): offset_w = slope * load_w + intercept.
+# Fit from meter readings 2026-08-21, 40 W import buffer, never bias toward export.
+ct_cal_slope = -0.045
+ct_cal_intercept = 20
+ct_cal_max_w = 0
+
+[core.emulator]
+dischg_max_a = 150          # raised from 100 A 2026-09-06
+chg_max_a = 100
+
+[hub.mqtt]
+enabled = true
+host = "192.168.0.97"
+username = "mqtt-user"
+password = "secret"
+
+[hub.planner]
+load_margin = 1.05          # set by the user 2026-09-07
+pv_margin = 0.9
+# dry_run = true            # log decisions, never write to the inverter
+# reserve_soc = 20
+# weekday_sop = "0-6,10-14"
+# weekend_sop = "0-14"
+# extra_holidays = ["2026-12-24"]
+
+[hub.web]
+port = 80

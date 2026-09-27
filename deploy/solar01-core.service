@@ -1,0 +1,35 @@
+[Unit]
+Description=solar01 core: inverter + JK BMS serial I/O and BMS emulator (no network)
+Documentation=file:///opt/solar01/current/README.md
+After=local-fs.target
+# the legacy scripts own the same serial ports: starting one stops the other
+Conflicts=solar-mqtt.service bms-emu.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=/usr/bin/python3 -m solar01 --config /etc/solar01/config.toml core
+WorkingDirectory=/opt/solar01/current
+Environment=PYTHONPATH=/opt/solar01/current PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+# root for the serial ports and vcgencmd (/dev/vchiq is root-only on this image);
+# group solar01 so the hub can reach the socket in /run/solar01
+User=root
+Group=solar01
+UMask=0007
+RuntimeDirectory=solar01
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+Restart=always
+RestartSec=2
+WatchdogSec=30
+TimeoutStopSec=10
+Nice=-5
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+ReadWritePaths=/run/solar01
+
+[Install]
+WantedBy=multi-user.target

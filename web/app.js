@@ -349,6 +349,9 @@ function decisionSentence(pl) {
     return `Manual charge to ${m.target_soc} %${m.eta ? `, expected at ${hhmm(isoTs(m.eta))}` : ''}. It stops by ${by} at the latest.`;
   }
   if (!pl.enabled) return 'The planner is off, so the inverter follows its own settings.';
+  if (p.uv_hold && p.hold) {
+    return `A cell fell to ${num(p.uv_cell_mv / 1000, 2)} V, below ${num(p.cell_uv_standby_mv / 1000, 2)} V. Standby until ${hhmm(isoTs(p.hold_end))} so the BMS does not cut out; the grid carries the house.`;
+  }
   if (p.action === 'stale') return 'No fresh inverter data, so the planner is not changing anything.';
   if (p.action === 'waiting') return 'The planner is waiting for the clock to synchronise.';
   if (p.action === 'starting' || !p.action) return 'The planner is starting.';

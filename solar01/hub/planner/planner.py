@@ -21,6 +21,13 @@ Manual charge (from the web console): a quick charge to a target SOC, or for a f
 replaces the planner's decision until it finishes, is cancelled, or hits its deadline.  It uses the
 same actuator (so the same re-arming, rate limit and core safety rules), runs whether or not the
 planner is enabled and at any time of day, and survives a hub restart (kept in kv 'manual_charge').
+Cell undervoltage standby: when any cell reads below cell_uv_standby_mv (fresh BMS data) while PV cannot
+carry the house, the inverter goes into standby (grid feeds the loads) so the BMS never trips on
+undervoltage.  It is latched until the next super off-peak window starts (a resting cell recovers
+voltage, so releasing at the threshold would flap), or until PV is expected to carry the house, and
+kept across hub restarts (kv 'cell_uv_hold').  A planned or manual charge still runs.  Every core
+state message is checked, so it acts within seconds rather than at the next minute tick.
+
 A charge to a SOC gets a deadline of 1.5 x the estimated time plus 30 minutes (1 hour to
 manual_max_h), so a charge the BMS or inverter holds back cannot run on indefinitely.
 """
@@ -83,6 +90,8 @@ class Planner:
         self.kick = asyncio.Event()
         self.manual: dict | None = history.get('manual_charge')
         self._manual_ended = False            # the running quick charge was the manual one, not the planner's
+        self.uv_hold: dict | None = history.get('cell_uv_hold')
+        self._uv_kick_mono = -1e9
 
     # -- inputs ----------------------------------------------------------------------------------
     def inputs(self) -> dict | None:
@@ -107,6 +116,9 @@ class Planner:
         now_mono = time.monotonic() if now_mono is None else now_mono
         x = self.inputs()
         last, self._obs_mono = self._obs_mono, now_mono
+        if x and self.enabled and not self.uv_hold and self.cell_low(x) is not None and now_mono - self._uv_kick_mono > 60:
+            self._uv_kick_mono = now_mono                 # cell undervoltage: decide now, not at the next tick
+            self.kick.set()
         if not x or not x['inv'] or last is None:
             return
         inv = x['inv']
@@ -156,6 +168,66 @@ class Planner:
             regs[H_QC] = h[H_QC] & ~BIT_QC & 0xFFFF
         if regs:
             await self.write(regs, desc)
+
+    # -- cell undervoltage ------------------------------------------------------------------------
+    def cell_low(self, x: dict) -> int | None:
+        """Lowest cell in mV if it is below cell_uv_standby_mv and the BMS data is fresh, else None."""
+        limit = self.p.cell_uv_standby_mv
+        cmin = x['jk'].get('cell_voltage_min')
+        if not limit or not cmin or x['jk_age'] is None or x['jk_age'] > 30:
+            return None
+        return int(cmin) if cmin < limit else None
+
+    def set_uv_hold(self, hold: dict | None, why: str) -> None:
+        self.uv_hold = hold
+        self.hist.set('cell_uv_hold', hold)
+        self.store.add_event('warning' if hold else 'info', why, source='planner')
+
+    def uv_step(self, x: dict, now_dt: dt.datetime, load_fn, pv_fn, pv_now_w) -> dt.datetime | None:
+        """Latch, keep or release the cell undervoltage standby.  Returns its end if it applies now."""
+        cal = self.cal
+        now = now_dt.timestamp()
+        win = cal.current_window(now_dt)
+        next_start = cal.next_window_start(win[1] if win else now_dt)
+        h = self.uv_hold
+        if h and (now >= h['until'] or not self.enabled):
+            self.set_uv_hold(None, 'cell undervoltage standby ended: ' + ('planner disabled' if not self.enabled else
+                                                                         'super off-peak started'))
+            h = None
+        if h:
+            end = model.standby_end(self.p, now_dt, dt.datetime.fromtimestamp(h['until'], cal.tz), load_fn, pv_fn, pv_now_w)
+            if end is None:
+                self.set_uv_hold(None, 'cell undervoltage standby ended: solar now carries the house')
+            return end
+        mv = self.cell_low(x) if self.enabled else None
+        if mv is None:
+            return None
+        end = model.standby_end(self.p, now_dt, next_start, load_fn, pv_fn, pv_now_w)
+        if end is None:
+            return None
+        self.set_uv_hold({'since': round(now), 'until': round(next_start.timestamp()), 'mv': mv},
+                         f'cell at {mv} mV, below {self.p.cell_uv_standby_mv} mV: standby until {end:%H:%M} so the BMS '
+                         f'does not cut out on undervoltage')
+        return end
+
+    def uv_plan(self, plan: dict, end: dt.datetime, now_dt: dt.datetime, soc: float, batt_kwh: float, load_fn,
+                pv_fn, cap_kw: float) -> dict:
+        """The decision with the undervoltage standby in force (a charge, planned or manual, still takes precedence)."""
+        if plan.get('action') == 'on':
+            return plan
+        out = dict(plan, hold=True, uv_hold=True, uv_cell_mv=self.uv_hold['mv'],
+                   cell_uv_standby_mv=self.p.cell_uv_standby_mv, hold_start=now_dt.isoformat(timespec='minutes'),
+                   hold_end=end.isoformat(timespec='minutes'),
+                   reason=f'a cell fell to {self.uv_hold["mv"]} mV (below {self.p.cell_uv_standby_mv} mV): standby until '
+                          f'{end:%H:%M}, the grid carries the house' + (f'; {plan["reason"]}' if plan.get('in_sop') else ''))
+        out.pop('floor_holds', None)
+        if not plan.get('in_sop'):
+            # the battery rests until the standby ends; the rolling projection continues from there
+            log: list = []
+            model.simulate(self.p, now_dt, soc, end, batt_kwh, load_fn, pv_fn, hold_from=now_dt, hold_until=end,
+                           soc_log=log, chg_cap_kw=cap_kw)
+            out.update(projection=model._projection(now_dt, soc, log), horizon=end.isoformat(timespec='minutes'))
+        return out
 
     # -- manual charge ---------------------------------------------------------------------------
     def current_soc(self, x: dict) -> float | None:
@@ -342,6 +414,9 @@ class Planner:
                                          currently_on, None, pv_now_w, in_standby, cap_kw)
         if self.manual:
             result = self.manual_plan(result, now_dt, soc, batt_kwh, load_fn, pv_fn, charge_kw, cap_kw)
+        uv_end = self.uv_step(x, now_dt, load_fn, pv_fn, pv_now_w)
+        if uv_end is not None:
+            result = self.uv_plan(result, uv_end, now_dt, soc, batt_kwh, load_fn, pv_fn, cap_kw)
         plan.update(result)
         # a full day: this decision, then a preview of what each later window would decide
         plan.update(await asyncio.to_thread(model.rolling_projection, p, cal, now_dt, soc, batt_kwh, load_fn, pv_fn,

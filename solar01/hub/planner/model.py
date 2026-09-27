@@ -119,13 +119,9 @@ def _periods(starts, step, until) -> list[tuple]:
     return [(a, min(b, until)) for a, b in out if a < until]
 
 
-def floor_hold(p, now, until, soc, load_fn, pv_fn, pv_now_w=None, currently_holding=False):
-    """Outside SOP: end of the floor standby to hold now, or None.  At the floor (kept while already in standby,
-    within hyst_soc) and while PV cannot carry the house, standby until `until` (the next window start) or until PV
-    is expected to cover the load, whichever is first."""
-    if soc > p.floor_soc + (p.hyst_soc if currently_holding else 0.0):
-        return None
-
+def standby_end(p, now, until, load_fn, pv_fn, pv_now_w=None):
+    """End of a protective standby that starts now: `until` (the next window start), or earlier once PV is expected
+    to carry the house.  None if PV carries the house now (standby would waste it; the battery is not draining)."""
     def short(t):
         return pv_fn(t) * p.pv_margin < load_fn(t) * p.load_margin
     if not (short(now) and short(now + dt.timedelta(minutes=30))):
@@ -138,6 +134,14 @@ def floor_hold(p, now, until, soc, load_fn, pv_fn, pv_now_w=None, currently_hold
         end += step
     end = min(end, until)
     return end if end - now >= step else None
+
+
+def floor_hold(p, now, until, soc, load_fn, pv_fn, pv_now_w=None, currently_holding=False):
+    """Outside SOP: end of the floor standby to hold now, or None.  At the floor (kept while already in standby,
+    within hyst_soc) and while PV cannot carry the house (standby_end)."""
+    if soc > p.floor_soc + (p.hyst_soc if currently_holding else 0.0):
+        return None
+    return standby_end(p, now, until, load_fn, pv_fn, pv_now_w)
 
 
 def decide(p, cal, now, soc, batt_kwh, load_fn, pv_fn, charge_kw, currently_on, hold_enabled=None,

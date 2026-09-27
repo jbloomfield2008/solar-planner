@@ -7,7 +7,8 @@ Home solar controller on a Raspberry Pi. It does three jobs:
 2. **Charge planner**: for the SDG&E time-of-use plan, decides standby holds and grid quick-charges, only ever
    inside super off-peak windows. It acts only when the forecast would take the battery below the 15 % floor
    before the next window, and sizes the charge to keep a 20 % reserve. Outside the windows, a battery at the
-   floor goes into standby (the grid carries the house) until the next window. Also runs **manual charges**
+   floor goes into standby (the grid carries the house) until the next window, and so does the battery when
+   any cell drops below 2.8 V. Also runs **manual charges**
    (to a target SOC, or for a set time) started from the console.
 3. **CT calibration**: adjusts the inverter's CT offset register (H119) from the house load.
 

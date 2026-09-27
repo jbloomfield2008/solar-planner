@@ -96,6 +96,8 @@ class PlannerConfig:
     reserve_soc: float = 20.0            # a needed hold or charge is sized to keep SOC above this until the next window
     floor_soc: float = 15.0              # hard floor: the planner acts only if SOC would fall below it; outside super
                                          # off-peak it holds standby at the floor (grid feeds the house) until the next window
+    cell_uv_standby_mv: int = 2800       # any cell below this (fresh BMS data): standby until the next window, so the
+                                         # BMS never trips on undervoltage; 0 disables
     max_soc: float = 100.0
     batt_kwh: float = 0.0                # 0 = JK capacity (Ah) x nominal_v
     nominal_v: float = 51.2

@@ -1,7 +1,7 @@
 # solar01
 
 One application on the Raspberry Pi `solar01` that runs the EG4 FlexBoss21 inverter, the JK BMS
-bridge, the SDG&E time-of-use charge planner, the Home Assistant MQTT bridge and a local web
+bridge, the time-of-use charge planner, the Home Assistant MQTT bridge and a local web
 console. It replaces three scripts (`solar_mqtt.py`, `bms_emu.py`, `solar_tou.py`) that were
 glued together through Home Assistant's MQTT broker.
 

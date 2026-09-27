@@ -326,3 +326,8 @@ legend { font: 600 15.5px/1.3 var(--cond); padding: 0 6px 0 0; }
 .manual-row { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; }
 .manual-note { color: var(--ink-2); font-size: 13.5px; max-width: 60ch; }
 .floor { stroke: var(--critical); stroke-width: 1; stroke-dasharray: 2 3; }
+.manual-controls { border: 0; margin: 0; padding: 0; display: grid; gap: 10px; justify-items: start; }
+.manual-controls:disabled .filters button, .manual-controls:disabled input { cursor: default; }
+.manual-controls:disabled .filters button[aria-checked="false"], .manual-controls:disabled input { opacity: .6; }
+.btn-stop { background: var(--critical); border-color: var(--critical); color: #fff; }
+.btn-stop:hover { background: color-mix(in srgb, var(--critical) 85%, #000); }

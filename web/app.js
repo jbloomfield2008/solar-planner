@@ -1201,40 +1201,46 @@ function ManualCharge({ s }) {
       setBusy(false);
     }
   }
+  // while a manual charge runs, the controls show its settings (locked) and the button stops it
+  const shownMode = m ? m.mode : mode;
+  const shownTarget = m ? m.target_soc : target;
+  const shownMinutes = m ? Math.round((m.until - m.started) / 60) : minutes;
+  const low = !m && socNow != null && mode === 'soc' && target <= socNow;
+  let note;
   if (m) {
-    const text = m.mode === 'time'
+    note = m.mode === 'time'
       ? `Charging from the grid until ${hhmm(m.until)}, started at ${hhmm(m.started)} from ${num(m.start_soc)} %.`
       : `Charging to ${m.target_soc} %${m.eta ? `, expected at ${hhmm(isoTs(m.eta))}` : ''}. Stops by ${hhmm(m.until)} at the latest.`;
-    return html`<div class="manual">
-      <h3>Manual charge</h3>
-      <p class="bridge-status st-ok"><${Icon} kind="ok" /><span>${text}</span></p>
-      <button class="btn" disabled=${busy} onClick=${() => send('DELETE')}>Stop the charge</button>
-      ${error ? html`<p class="error-text" role="alert">${error}</p>` : null}
-    </div>`;
+  } else {
+    note = `${socNow != null ? `The battery is at ${num(socNow)} % now. ` : ''}${low ? 'Pick a target above that. ' : ''}${
+      period !== 'super_off_peak' ? `It is ${PERIOD[period].toLowerCase()} now, so this charge is billed at the ${PERIOD[period].toLowerCase()} rate. ` : ''}${
+      pl.enabled ? 'The planner resumes when the charge ends.' : 'The planner is off; the charge still runs and stops by itself.'}`;
   }
-  const low = socNow != null && mode === 'soc' && target <= socNow;
   return html`<div class="manual">
     <h3>Manual charge</h3>
-    <div class="filters" role="radiogroup" aria-label="Charge until">
-      <button role="radio" aria-checked=${mode === 'soc'} onClick=${() => setMode('soc')}>To a state of charge</button>
-      <button role="radio" aria-checked=${mode === 'time'} onClick=${() => setMode('time')}>For a set time</button>
-    </div>
-    ${mode === 'soc' ? html`<div class="manual-row">
-      <label class="field inline"><span>Target</span><span class="input-unit"><input type="number" min="5" max="100" step="1"
-        value=${target} onInput=${(e) => setTarget(Number(e.target.value))} /><span aria-hidden="true">%</span></span></label>
-      <div class="filters" role="radiogroup" aria-label="Target presets">
-        ${SOC_PRESETS.map((v) => html`<button role="radio" aria-checked=${target === v} onClick=${() => setTarget(v)}>${`${v} %`}</button>`)}
+    <fieldset class="manual-controls" disabled=${!!m || busy}>
+      <legend class="vh">Charge settings</legend>
+      <div class="filters" role="radiogroup" aria-label="Charge until">
+        <button role="radio" aria-checked=${shownMode === 'soc'} onClick=${() => setMode('soc')}>To a state of charge</button>
+        <button role="radio" aria-checked=${shownMode === 'time'} onClick=${() => setMode('time')}>For a set time</button>
       </div>
-    </div>` : html`<div class="manual-row">
-      <div class="filters" role="radiogroup" aria-label="Duration">
-        ${TIME_PRESETS.map(([v, label]) => html`<button role="radio" aria-checked=${minutes === v} onClick=${() => setMinutes(v)}>${label}</button>`)}
-      </div>
-    </div>`}
-    <p class="manual-note">${socNow != null ? `The battery is at ${num(socNow)} % now. ` : ''}${low ? 'Pick a target above that. ' : ''}${
-      period !== 'super_off_peak' ? `It is ${PERIOD[period].toLowerCase()} now, so this charge is billed at the ${PERIOD[period].toLowerCase()} rate. ` : ''}${
-      pl.enabled ? 'The planner resumes when the charge ends.' : 'The planner is off; the charge still runs and stops by itself.'}</p>
-    <button class="btn btn-primary" disabled=${busy || low || socNow == null}
-      onClick=${() => send('POST', mode === 'soc' ? { mode, target_soc: target } : { mode, minutes })}>Start charging</button>
+      ${shownMode === 'soc' ? html`<div class="manual-row">
+        <label class="field inline"><span>Target</span><span class="input-unit"><input type="number" min="5" max="100" step="1"
+          value=${shownTarget} onInput=${(e) => setTarget(Number(e.target.value))} /><span aria-hidden="true">%</span></span></label>
+        <div class="filters" role="radiogroup" aria-label="Target presets">
+          ${SOC_PRESETS.map((v) => html`<button role="radio" aria-checked=${shownTarget === v} onClick=${() => setTarget(v)}>${`${v} %`}</button>`)}
+        </div>
+      </div>` : html`<div class="manual-row">
+        <div class="filters" role="radiogroup" aria-label="Duration">
+          ${TIME_PRESETS.map(([v, label]) => html`<button role="radio" aria-checked=${shownMinutes === v} onClick=${() => setMinutes(v)}>${label}</button>`)}
+        </div>
+      </div>`}
+    </fieldset>
+    ${m ? html`<p class="bridge-status st-ok" role="status"><${Icon} kind="ok" /><span>${note}</span></p>`
+      : html`<p class="manual-note">${note}</p>`}
+    ${m ? html`<button class="btn btn-stop" disabled=${busy} onClick=${() => send('DELETE')}>${busy ? 'Stopping…' : 'Stop charging'}</button>`
+      : html`<button class="btn btn-primary" disabled=${busy || low || socNow == null}
+          onClick=${() => send('POST', mode === 'soc' ? { mode, target_soc: target } : { mode, minutes })}>${busy ? 'Starting…' : 'Start charging'}</button>`}
     ${error ? html`<p class="error-text" role="alert">${error}</p>` : null}
   </div>`;
 }

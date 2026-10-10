@@ -7,9 +7,13 @@ Home solar controller on a Raspberry Pi. It does three jobs:
 2. **Charge planner**: for the SDG&E time-of-use plan, decides standby holds and grid quick-charges, only ever
    inside super off-peak windows. It acts only when the forecast would take the battery below the 15 % floor
    before the next window, and sizes the charge to keep a 20 % reserve. Outside the windows, a battery at the
-   floor goes into standby (the grid carries the house) until the next window, and so does the battery when
-   any cell drops below 2.8 V. Also runs **manual charges**
+   floor goes into standby (the grid carries the house) until the next window. Also runs **manual charges**
    (to a target SOC, or for a set time) started from the console.
+
+Cell undervoltage is handled by the BMS emulator in the core, not the planner: when any cell is at or below
+`cell_uv_mv` (2.8 V) the emulator reports discharge not allowed until every cell is back at `cell_uv_restore_mv`
+(3.0 V). Charging stays allowed, so the inverter keeps using PV and takes the rest of the load from the grid.
+Do not use standby for this: standby also idles PV, which is what would have recharged the cell.
 3. **CT calibration**: adjusts the inverter's CT offset register (H119) from the house load.
 
 A local web console (port 80) also shows headline numbers: solar forecast and actual, home use, SOC and its
@@ -29,7 +33,7 @@ changing anything that writes to the inverter.
 | Data | `/var/lib/solar01/solar01.db` (SQLite, WAL): hourly energy, minute averages, events, kv settings |
 | Services | `solar01-core` (root, serial I/O, no network) and `solar01-hub` (user solar01: planner, web, MQTT) |
 | Console | http://192.168.0.162/ with a JSON API under `/api/` (listed at the top of `solar01/hub/web.py`) |
-| Home Assistant | MQTT broker at 192.168.0.97 (optional; the Pi must never depend on it) |
+| Home Assistant | MQTT broker at 192.168.0.138 (optional; the Pi must never depend on it) |
 | Remote | https://github.com/jbloomfield2008/solar-planner |
 
 ## Layout

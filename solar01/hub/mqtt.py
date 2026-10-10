@@ -211,7 +211,8 @@ def discovery_messages(prefix: str = 'homeassistant') -> list[tuple[str, dict]]:
     for key, name in TOU_BINARY.items():
         out.append((f'{prefix}/binary_sensor/solar01_tou_{key}/config',
                     {'name': name, 'unique_id': f'solar01_tou_{key}', 'state_topic': T_TOU,
-                     'value_template': '{{ value_json.%s }}' % key, 'payload_on': 'True', 'payload_off': 'False',
+                     # .get(): the planner omits some keys (e.g. night) in branches where they do not apply
+                     'value_template': "{{ value_json.get('%s') }}" % key, 'payload_on': 'True', 'payload_off': 'False',
                      'device': TOU_DEVICE, 'expire_after': 600, **_avail(T_TOU_AVAIL)}))
     out.append((f'{prefix}/switch/solar01_tou_enabled/config',
                  {'name': 'Planner enabled', 'unique_id': 'solar01_tou_enabled', 'state_topic': T_TOU,

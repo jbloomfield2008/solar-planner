@@ -12,6 +12,9 @@ DELETE /api/charge      cancel the manual charge
 GET  /api/summary       headline numbers: today's energy, SOC vs 24 h ago, billing cycle totals and cost
 GET  /api/tariff        TOU rates, usage tiers, billing cycle start day
 PUT  /api/tariff        replace them (validated; see solar01/hub/tariff.py)
+GET  /api/settings      settings the console may change: value, config file value, bounds (solar01/settings.py)
+PUT  /api/settings      {"values": {"hub.planner.reserve_soc": 25, "core.jkbms.poll_s": null}}; null restores
+                        the config file value; all or nothing
 GET  /api/config        effective configuration (password redacted)
 GET  /healthz           200 when the core link is up and data is fresh, else 503
 """
@@ -184,8 +187,36 @@ def create_app(store, history, cfg) -> web.Application:
                                        planner.plan, soc, now)
         return _json(data)
 
+    async def settings_get(_request):
+        if store.settings is None:
+            return _json({'error': 'settings not available'}, 503)
+        return _json({'items': store.settings.items()})
+
+    async def settings_put(request):
+        if store.settings is None:
+            return _json({'error': 'settings not available'}, 503)
+        try:
+            body = await request.json()
+        except ValueError:
+            return _json({'error': 'expected JSON'}, 400)
+        try:
+            await store.settings.update(body.get('values') if isinstance(body, dict) else None, f'web {request.remote}')
+        except ValueError as e:
+            return _json({'error': str(e)}, 400)
+        except (ConnectionError, asyncio.TimeoutError) as e:
+            return _json({'error': str(e) or 'the core did not answer'}, 503)
+        return _json({'items': store.settings.items()})
+
     async def config_api(_request):
-        return _json(config_mod.redacted(cfg))
+        data = config_mod.redacted(cfg)
+        core = store.settings.core_state() if store.settings else None
+        for key, value in (core or {}).get('values', {}).items():
+            section = data
+            *path, name = key.split('.')
+            for part in path:
+                section = section[part]
+            section[name] = value                    # the core's own values, console overrides included
+        return _json(data)
 
     async def healthz(_request):
         h = store.health()
@@ -204,6 +235,8 @@ def create_app(store, history, cfg) -> web.Application:
     app.router.add_get('/api/summary', summary_api)
     app.router.add_get('/api/tariff', tariff_get)
     app.router.add_put('/api/tariff', tariff_put)
+    app.router.add_get('/api/settings', settings_get)
+    app.router.add_put('/api/settings', settings_put)
     app.router.add_get('/api/config', config_api)
     app.router.add_get('/healthz', healthz)
     if os.path.isdir(static_dir):

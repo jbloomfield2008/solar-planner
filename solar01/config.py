@@ -16,7 +16,7 @@ class InverterConfig:
     port: str = BY_PATH + 'usb-0:1.2:1.0-port0'      # meter port (Modbus RTU master)
     baud: int = 19200
     slave: int = 1
-    poll_s: float = 5.0                  # FlexBoss21 dislikes faster polling
+    poll_s: float = 5.0                  # inverter sample time; the FlexBoss21 dislikes faster polling
     pv_avg_s: float = 60.0               # pv_power = rolling mean; pv_power_raw = instantaneous
     holding_refresh_s: float = 60.0
     # dynamic CT calibration, H119 (signed, LSB 0.1 W, firmware clamps +5000/-2500 units):
@@ -37,7 +37,7 @@ class InverterConfig:
 class JkConfig:
     port: str = BY_PATH + 'usb-0:1.1:1.0-port0'
     baud: int = 115200
-    poll_s: float = 5.0
+    poll_s: float = 1.0                  # battery sample time; the BMS emulator always serves the latest sample
     cells: int = 16                      # frames with a different cell count are rejected
 
 
@@ -56,7 +56,8 @@ class EmulatorConfig:
     taper_min_a: float = 5.0
     chg_min_temp_c: float = 2.0
     chg_max_temp_c: float = 50.0
-    cell_uv_mv: int = 2800
+    cell_uv_mv: int = 2800               # any cell at or below this: discharge not allowed (charging still is,
+    cell_uv_restore_mv: int = 3000       # so PV keeps working) until every cell is back at or above this
     stale_s: float = 30.0                # JK data older than this: charge forbidden
     dead_s: float = 300.0                # older than this: stop answering (BMS comm loss)
     soh: int = 100
@@ -69,6 +70,7 @@ class EmulatorConfig:
 class CoreConfig:
     socket: str = '/run/solar01/core.sock'           # or tcp://127.0.0.1:8765 (development)
     state_file: str = '/run/solar01/core-state.json'
+    settings_file: str = '/var/lib/solar01-core/settings.json'   # console overrides of core settings ('' = none)
     broadcast_s: float = 2.0
     pi_health_s: float = 30.0
     simulate: bool = False               # fake devices, for development without hardware
@@ -93,11 +95,9 @@ class PlannerConfig:
     weekend_sop: str = '0-14'
     on_peak: str = '16-21'               # display only: the planner itself only needs super-off-peak
     extra_holidays: list[str] = dc.field(default_factory=list)
-    reserve_soc: float = 20.0            # a needed hold or charge is sized to keep SOC above this until the next window
-    floor_soc: float = 15.0              # hard floor: the planner acts only if SOC would fall below it; outside super
-                                         # off-peak it holds standby at the floor (grid feeds the house) until the next window
-    cell_uv_standby_mv: int = 2800       # any cell below this (fresh BMS data): standby until the next window, so the
-                                         # BMS never trips on undervoltage; 0 disables
+    reserve_soc: float = 20.0            # inside a window the planner holds / charges so SOC stays above this until the next window
+    floor_soc: float = 15.0              # buffer under the reserve for use above the forecast, never a planning target; outside
+                                         # super off-peak it holds standby at the floor (grid feeds the house) until the next window
     max_soc: float = 100.0
     batt_kwh: float = 0.0                # 0 = JK capacity (Ah) x nominal_v
     nominal_v: float = 51.2

@@ -2,12 +2,18 @@
 #
 # Only values that differ from the built-in defaults are needed.  Every default lives in
 # solar01/config.py with a comment; unknown keys are rejected at startup.
+# Many settings can also be changed in the console (Settings); a console change overrides the
+# value here until it is cleared there (solar01/settings.py lists which).
 # Check the effective configuration with:
 #   PYTHONPATH=/opt/solar01/current python3 -m solar01 --config /etc/solar01/config.toml check-config
 
 log_level = "INFO"
 
+[core.jkbms]
+# poll_s = 1.0              # battery sample time, seconds
+
 [core.inverter]
+# poll_s = 5.0              # inverter sample time, seconds; the FlexBoss21 dislikes faster polling
 # Dynamic CT calibration (H119, LSB 0.1 W): offset_w = slope * load_w + intercept.
 # Fit from meter readings 2026-08-21, 40 W import buffer, never bias toward export.
 ct_cal_slope = -0.045

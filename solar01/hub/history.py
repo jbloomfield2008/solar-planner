@@ -197,15 +197,15 @@ class History:
         return [{'date': d, 'load_kwh': round(v[0] / 1000, 2), 'pv_kwh': round(v[1] / 1000, 2)} for d, v in sorted(acc.items())]
 
     def hourly_energy(self, since_ts: float, until_ts: float) -> list[tuple]:
-        """[(hour ts, load_wh, pv_wh, grid_in_wh, grid_out_wh)] for hours starting in [since_ts, until_ts),
+        """[(hour ts, load_wh, pv_wh, grid_in_wh, grid_out_wh, secs)] for hours starting in [since_ts, until_ts),
         including the hour in progress.  Grid values are None for hours recorded before they were kept."""
         with self.lock:
-            rows = self.db.execute('SELECT ts, load_wh, pv_wh, grid_in_wh, grid_out_wh FROM hourly WHERE ts >= ? AND ts < ? '
+            rows = self.db.execute('SELECT ts, load_wh, pv_wh, grid_in_wh, grid_out_wh, secs FROM hourly WHERE ts >= ? AND ts < ? '
                                    'ORDER BY ts', (int(since_ts), int(until_ts))).fetchall()
             b = self.bucket
         out = {r[0]: tuple(r) for r in rows}
         if b and since_ts <= b[0] < until_ts:
-            out[b[0]] = (b[0], b[1], b[2], b[5], b[6])
+            out[b[0]] = (b[0], b[1], b[2], b[5], b[6], b[3])
         return [out[k] for k in sorted(out)]
 
     def soc_near(self, ts: float, within_s: float = 900) -> tuple[float, float] | None:

@@ -231,12 +231,31 @@ class DecideTest(unittest.TestCase):
             self.assertGreaterEqual(min(v for t, v in p['projection'] if t > stop), P.reserve_soc - 1)
             self.assertGreaterEqual(min(v for _, v in p['projection']), min(soc, P.floor_soc) - 1, 'never sinks meanwhile')
 
-    def test_floor(self):
-        """Dips below the reserve are left to the next window; the floor is held with standby outside super off-peak."""
-        # in a window: forecast dips below the 20 % reserve but stays above the 15 % floor -> nothing to do
-        p = decide(D(2026, 9, 28, 0), 52, load_fn, pv_sunny, 3.0, currently_on=False, hold_enabled=False)
+    def test_plans_to_the_reserve_not_the_floor(self):
+        """In a window the planner acts whenever the forecast dips below the reserve, even if it stays above the floor
+        (2026-10-08: a 10 % floor let the battery run down to 14 % because a 13 % forecast minimum was 'fine')."""
+        now = D(2026, 9, 28, 0)
+        p = decide(now, 52, load_fn, pv_sunny, 3.0, currently_on=False, hold_enabled=False)
         self.assertTrue(P.floor_soc <= p['forecast_min_soc'] < P.reserve_soc, p['forecast_min_soc'])
+        self.assertIsNotNone(p['target_soc'], 'a charge is planned to keep the reserve')
+        self.assertGreaterEqual(p['projected_min_soc'], P.reserve_soc - 1)
+        # a forecast that stays above the reserve needs nothing
+        p = decide(now, 80, load_fn, pv_sunny, 3.0, currently_on=False, hold_enabled=False)
+        self.assertGreaterEqual(p['forecast_min_soc'], P.reserve_soc)
         self.assertEqual((p['action'], p['target_soc']), ('off', None))
+
+    def test_hold_is_not_dropped_while_the_forecast_is_below_the_reserve(self):
+        """A hold in progress keeps going (and the charge behind it stays planned) until the forecast clears the reserve,
+        instead of ending as soon as the forecast clears the floor."""
+        load = lambda t: 430.0 if t.hour < 10 else 700.0                      # noqa: E731
+        pv = lambda t: 0.0 if t.hour < 8 else (700.0 if t.hour < 10 else 1500.0)  # noqa: E731
+        for hh, mm in ((0, 0), (1, 45), (3, 0)):
+            p = decide(D(2026, 10, 8, hh, mm), 37, load, pv, 3.0, currently_on=False, currently_holding=hh > 0)
+            self.assertNotEqual((p['action'], p.get('hold_start')), ('off', None), (hh, mm, p['reason']))
+            self.assertGreaterEqual(p['projected_min_soc'], P.reserve_soc - 1, (hh, mm))
+
+    def test_floor(self):
+        """The floor is held with standby outside super off-peak."""
         # outside a window at the floor, at night: standby until the next window, no charge
         p = decide(D(2026, 9, 28, 22), 15, load_fn, pv_sunny, 3.0, currently_on=False)
         self.assertEqual((p['action'], p['hold'], p['floor_hold']), ('off', True, True))

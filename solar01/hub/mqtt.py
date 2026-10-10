@@ -203,8 +203,10 @@ def discovery_messages(prefix: str = 'homeassistant') -> list[tuple[str, dict]]:
             c['icon'] = icon
         if key == 'action':
             c['json_attributes_topic'] = T_TOU
-            c['json_attributes_template'] = ('{{ {"trace": value_json.trace, "window": value_json.window, '
-                                             '"horizon": value_json.horizon, "warning": value_json.warning} | tojson }}')
+            # .get(): the planner payload omits window/horizon/warning when there is nothing to report,
+            # and a missing key here makes HA log a template error on every TOU update.
+            c['json_attributes_template'] = ('{{ {"trace": value_json.get("trace"), "window": value_json.get("window"), '
+                                             '"horizon": value_json.get("horizon"), "warning": value_json.get("warning")} | tojson }}')
         out.append((f'{prefix}/sensor/solar01_tou_{key}/config', c))
     for key, name in TOU_BINARY.items():
         out.append((f'{prefix}/binary_sensor/solar01_tou_{key}/config',

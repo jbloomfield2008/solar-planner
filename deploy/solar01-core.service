@@ -20,6 +20,9 @@ UMask=0007
 RuntimeDirectory=solar01
 RuntimeDirectoryMode=0750
 RuntimeDirectoryPreserve=yes
+# settings changed from the console (sample times, CT calibration), kept by the core itself
+StateDirectory=solar01-core
+StateDirectoryMode=0700
 Restart=always
 RestartSec=2
 WatchdogSec=30

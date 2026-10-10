@@ -8,9 +8,9 @@ computed with the capped rate.
 Decision rules, in order, inside a super-off-peak (SOP) window:
 
 1. Simulate to the start of the next SOP window with no hold and no grid charge.
-   If SOC stays at or above the floor (floor_soc): do nothing.  Dipping below the
-   reserve is fine; the next window deals with it.  Holds and charges that are needed
-   are sized to keep the reserve (reserve_soc), a buffer above the floor.
+   If SOC stays at or above the reserve (reserve_soc): do nothing.  The plan is always built around the
+   reserve; the floor (floor_soc) is not a planning target but the buffer under it, for the day actual use
+   exceeds the forecast.  Inside a window SOC below the reserve (or forecast to go below it) is always acted on.
 2. Otherwise find the shortest standby hold that closes the shortfall, ending as late
    as possible: at the stop time or when PV is expected, whichever is first.  Holding is
    skipped if it would make PV clip later.
@@ -251,10 +251,10 @@ def decide(p, cal, now, soc, batt_kwh, load_fn, pv_fn, charge_kw, currently_on, 
         return plan
 
     hyst = p.hyst_soc if (currently_on or currently_holding) else 0
-    if min_soc0 >= p.floor_soc + hyst:
+    if min_soc0 >= p.reserve_soc + hyst:
         plan.update(action='off', target_soc=None, grid_kwh=0.0,
                     reason=f'no hold or grid charge needed: forecast min SOC {min_soc0:.0f}% stays above the '
-                           f'{p.floor_soc:.0f}% floor')
+                           f'{p.reserve_soc:.0f}% reserve')
         project()
         return plan
 

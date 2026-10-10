@@ -17,6 +17,7 @@ from .. import __version__
 from ..ipc import CoreClient
 from ..util import clock_synced, sd_notify
 from .history import History
+from .overrides import ConsoleSettings
 from .planner.planner import Planner
 from .state import Store
 from .web import create_app
@@ -121,6 +122,8 @@ async def amain(cfg) -> int:
     history = History(cfg.hub.db)
     imported = history.import_legacy(cfg.hub.legacy_db)
     store = Store(history, cfg)
+    store.settings = ConsoleSettings(cfg, history, store)
+    store.settings.load()                             # before anything reads the configuration
     if imported:
         store.add_event('info', f'imported {imported} hourly rows from {cfg.hub.legacy_db}', source='hub')
     backfilled = history.backfill_minutes()
@@ -133,6 +136,7 @@ async def amain(cfg) -> int:
     store.core_link = core
     planner = Planner(cfg, history, store, core)
     store.planner = planner
+    store.settings.listeners.append(planner.settings_changed)
     store.state_listeners.append(Recorder(history, planner))
     loop = asyncio.get_running_loop()
     mqtt = None

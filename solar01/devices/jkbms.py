@@ -5,6 +5,7 @@ import struct
 import time
 
 REQUEST = bytes.fromhex('4e5700130000000006030000000000006800000129')
+MAX_FRAME = 4096                         # a real reply is ~300 bytes; a longer length field is noise
 
 # field id -> payload length (0x79 cell block is length-prefixed)
 FIELD_LEN = {0x80: 2, 0x81: 2, 0x82: 2, 0x83: 2, 0x84: 2, 0x85: 1, 0x86: 1, 0x87: 2, 0x89: 4, 0x8a: 2, 0x8b: 2,
@@ -94,9 +95,9 @@ def _default_serial(port: str, baud: int, timeout: float):
 
 
 class JkBms:
-    def __init__(self, port: str, baud: int = 115200, cells: int | None = 16, settle_s: float = 0.7,
+    def __init__(self, port: str, baud: int = 115200, cells: int | None = 16, reply_timeout_s: float = 1.2,
                  serial_factory=None):
-        self.port, self.baud, self.cells, self.settle_s = port, baud, cells, settle_s
+        self.port, self.baud, self.cells, self.reply_timeout_s = port, baud, cells, reply_timeout_s
         self._factory = serial_factory or _default_serial
         self._ser = None
 
@@ -112,8 +113,21 @@ class JkBms:
         """One request/response.  OSError means the port failed (close and retry later);
         None means the reply was missing or not plausible."""
         if self._ser is None:
-            self._ser = self._factory(self.port, self.baud, 0.5)
+            self._ser = self._factory(self.port, self.baud, 0.1)
         self._ser.reset_input_buffer()
         self._ser.write(REQUEST)
-        time.sleep(self.settle_s)
-        return parse(self._ser.read(4096), self.cells)
+        return parse(self._read_frame(), self.cells)
+
+    def _read_frame(self) -> bytes:
+        """Read one reply, returning as soon as it is complete: "NW", then a u16 length that counts
+        every byte after the "NW".  Whatever arrived is returned if the reply timeout runs out."""
+        deadline = time.monotonic() + self.reply_timeout_s
+        buf = b''
+        while time.monotonic() < deadline:
+            start = buf.find(b'NW')
+            buf = buf[start:] if start >= 0 else buf[-1:]     # drop noise before the frame, keep a trailing 'N'
+            want = 2 + _u16(buf, 2) if len(buf) >= 4 and buf[:2] == b'NW' else 4
+            if want > MAX_FRAME or len(buf) >= want:
+                return buf[:want]
+            buf += self._ser.read(want - len(buf))
+        return buf

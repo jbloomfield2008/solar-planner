@@ -12,6 +12,7 @@ from solar01.core.service import Core
 from solar01.devices import sim
 from solar01.hub import mqtt
 from solar01.hub.history import History
+from solar01.hub.overrides import ConsoleSettings
 from solar01.hub.planner.planner import Planner
 from solar01.hub.service import Recorder
 from solar01.hub.state import Store
@@ -97,7 +98,8 @@ class EventReplayTest(unittest.TestCase):
 
 def sim_core(tmp):
     cfg = config.from_dict({'core': {
-        'socket': 'tcp://127.0.0.1:0', 'state_file': tmp + '/core-state.json', 'broadcast_s': 0.2, 'simulate': True,
+        'socket': 'tcp://127.0.0.1:0', 'state_file': tmp + '/core-state.json', 'settings_file': tmp + '/settings.json',
+        'broadcast_s': 0.2, 'simulate': True,
         'inverter': {'poll_s': 0.2, 'holding_refresh_s': 0.5}, 'jkbms': {'poll_s': 0.2}}})
     plant = sim.SimPlant(soc=35)
     core = Core(cfg, devices={'inverter': sim.SimInverter(plant), 'jk': sim.SimJk(plant), 'emulator_serial': None})
@@ -195,6 +197,57 @@ class EndToEndTest(unittest.TestCase):
                 link_task.cancel()
                 await asyncio.gather(link_task, return_exceptions=True)
                 history.close()
+        asyncio.run(scenario())
+
+    def test_console_settings(self):
+        async def scenario():
+            history = History(':memory:')
+            store = Store(history, self.cfg)
+            store.settings = ConsoleSettings(self.cfg, history, store)
+            store.settings.load()
+            link = CoreClient(self.cfg.core.socket, store.on_core_message, name='hub-test')
+            store.core_link = link
+            planner = Planner(self.cfg, history, store, link)
+            store.planner = planner
+            store.settings.listeners.append(planner.settings_changed)
+            link_task = asyncio.create_task(link.run())
+            try:
+                for _ in range(100):
+                    if link.connected and store.core_state:
+                        break
+                    await asyncio.sleep(0.05)
+                async with TestClient(TestServer(create_app(store, history, self.cfg))) as client:
+                    items = {i['key']: i for i in (await (await client.get('/api/settings')).json())['items']}
+                    self.assertEqual(items['core.jkbms.poll_s']['value'], 0.2)
+                    self.assertTrue(items['core.jkbms.poll_s']['available'])
+                    self.assertEqual(items['hub.planner.reserve_soc']['value'], 20.0)
+                    r = await client.put('/api/settings', json={'values': {
+                        'hub.planner.reserve_soc': 30, 'hub.planner.weekend_sop': '0-12', 'core.jkbms.poll_s': 2}})
+                    self.assertEqual(r.status, 200, await r.text())
+                    items = {i['key']: i for i in (await r.json())['items']}
+                    self.assertEqual((items['hub.planner.reserve_soc']['value'], items['core.jkbms.poll_s']['value']),
+                                     (30.0, 2.0))
+                    self.assertTrue(items['core.jkbms.poll_s']['overridden'])
+                    self.assertEqual(self.core.c.jkbms.poll_s, 2.0, 'the core applied its part')
+                    self.assertEqual(planner.cal.weekend, [(0, 12)], 'the calendar was rebuilt')
+                    self.assertEqual(history.get('settings'), {'hub.planner.reserve_soc': 30.0,
+                                                               'hub.planner.weekend_sop': '0-12'})
+                    # the core refuses its part: the hub part is not applied either
+                    r = await client.put('/api/settings', json={'values': {'hub.planner.reserve_soc': 40,
+                                                                           'core.inverter.poll_s': 1}})
+                    self.assertEqual(r.status, 400)
+                    self.assertIn('Inverter sample time', (await r.json())['error'])
+                    self.assertEqual(self.cfg.hub.planner.reserve_soc, 30.0)
+                    r = await client.put('/api/settings', json={'values': {'core.emulator.chg_max_a': 50}})
+                    self.assertEqual(r.status, 400)
+                    r = await client.put('/api/settings', json={'values': {'hub.planner.reserve_soc': None}})
+                    self.assertEqual(r.status, 200)
+                    self.assertEqual(self.cfg.hub.planner.reserve_soc, 20.0)
+                    r = await client.get('/api/config')
+                    self.assertEqual((await r.json())['core']['jkbms']['poll_s'], 2.0)
+            finally:
+                link_task.cancel()
+                await asyncio.gather(link_task, return_exceptions=True)
         asyncio.run(scenario())
 
     def test_hub_survives_core_restart(self):

@@ -53,9 +53,10 @@ class TariffTest(unittest.TestCase):
         t = tariff.validate({'cycle_start_day': 5, 'rates': RATES, 'tiers': TIERS})
         self.assertEqual((t['cycle_start_day'], t['rates']['on_peak'], t['tiers'][0]['up_to_kwh']), (5, 0.5, 10.0))
         self.assertEqual(tariff.validate({})['tiers'], [])
+        self.assertEqual((tariff.validate({})['meter_offset_w'], tariff.validate({})['daily_fee']), (40.0, 0.74))
         self.assertFalse(tariff.configured(tariff.validate({})))
         for bad in ({'cycle_start_day': 0}, {'cycle_start_day': 2.5}, {'rates': {'on_peak': -1}},
-                    {'rates': {'on_peak': 'x'}}, {'tiers': [{'up_to_kwh': 10, 'adder': 0}]},
+                    {'rates': {'on_peak': 'x'}}, {'meter_offset_w': -1}, {'meter_offset_w': 501}, {'daily_fee': -0.1}, {'daily_fee': 'x'}, {'tiers': [{'up_to_kwh': 10, 'adder': 0}]},
                     {'tiers': [{'up_to_kwh': 10, 'adder': 0}, {'up_to_kwh': 5, 'adder': 0}, {'up_to_kwh': None}]},
                     {'tiers': [{'up_to_kwh': None, 'adder': 0}, {'up_to_kwh': None, 'adder': 0}]}, []):
             with self.assertRaises(ValueError, msg=bad):
@@ -90,7 +91,8 @@ class GridHistoryTest(unittest.TestCase):
         h.flush()
         rows = h.hourly_energy(t0, t0 + 7200)
         self.assertEqual([r[0] for r in rows], [t0, t0 + 3600])
-        _, load, pv, gin, gout = rows[0]
+        _, load, pv, gin, gout, secs = rows[0]
+        self.assertEqual(secs, 3570)
         # the first sample only starts the clock, so the hour is 30 s short
         self.assertAlmostEqual(load, 1000 * 3570 / 3600, delta=0.5)
         self.assertAlmostEqual(gin, 600 * 3570 / 3600, delta=0.5)
@@ -114,8 +116,8 @@ class GridHistoryTest(unittest.TestCase):
             self.assertEqual(h.backfill_grid(), 1)
             self.assertEqual(h.backfill_grid(), 0, 'runs once')
             rows = h.hourly_energy(0, 10000)
-            self.assertEqual(rows[0][3:], (600.0, 300.0))
-            self.assertEqual(rows[1][3:], (None, None))
+            self.assertEqual(rows[0][3:5], (600.0, 300.0))
+            self.assertEqual(rows[1][3:5], (None, None))
             h.add_minute(9000, {'soc': 40})
             h.add_minute(9030, {'soc': 40, 'jk_soc': 42})
             h.flush()
@@ -135,7 +137,7 @@ class HeadlineTest(unittest.TestCase):
         for t, load, pv, gin in rows:
             h.db.execute('INSERT INTO hourly VALUES (?,?,?,?,?,?,?)', (t, load, pv, 3600, 50, gin, 0))
         h.db.execute('INSERT INTO minute (ts, jk_soc) VALUES (?, ?)', (ts(2026, 9, 26, 18), 70))
-        t = tariff.validate({'cycle_start_day': 5, 'rates': RATES})
+        t = tariff.validate({'cycle_start_day': 5, 'rates': RATES, 'meter_offset_w': 0, 'daily_fee': 0})
         out = headline(h, CAL, ON_PEAK, t, {'pv_forecast_today_kwh': 9.5}, 55.0, D(2026, 9, 27, 18, 5))
         self.assertEqual(out['today'], {'date': '2026-09-27', 'pv_kwh': 2.0, 'load_kwh': 5.0, 'grid_kwh': 1.5,
                                         'export_kwh': 0.0, 'pv_forecast_kwh': 9.5, 'pv_forecast_tomorrow_kwh': None})
@@ -153,6 +155,28 @@ class HeadlineTest(unittest.TestCase):
         bare = headline(h, CAL, ON_PEAK, tariff.validate({}), {}, None, D(2026, 9, 27, 18, 5))['cycle']
         self.assertFalse(bare['configured'])
         self.assertNotIn('cost', bare)
+        # the daily fee: 23 days so far, in both costs, not in the savings
+        t['daily_fee'] = 0.74
+        f = headline(h, CAL, ON_PEAK, t, {}, None, D(2026, 9, 27, 18, 5))['cycle']
+        self.assertEqual((f['fees'], f['energy_cost']), (17.02, c['cost']))
+        self.assertAlmostEqual(f['cost'], c['cost'] + 17.02, places=2)
+        self.assertAlmostEqual(f['home_cost'], c['home_cost'] + 17.02, places=2)
+        self.assertEqual(f['saved'], c['saved'])
+
+    def test_meter_offset(self):
+        h = History(':memory:')
+        # a full hour at 0 W import, one with 1 kWh import, one reporting 30 Wh "export", one half recorded
+        rows = [(ts(2026, 9, 27, 2), 500, 0, 0, 0, 3600), (ts(2026, 9, 27, 3), 1500, 0, 1000, 0, 3600),
+                (ts(2026, 9, 27, 9), 300, 2000, 0, 30, 3600), (ts(2026, 9, 27, 17), 800, 0, 0, 0, 1800)]
+        for r in rows:
+            h.db.execute('INSERT INTO hourly (ts, load_wh, pv_wh, grid_in_wh, grid_out_wh, secs) VALUES (?,?,?,?,?,?)', r)
+        t = tariff.validate({'cycle_start_day': 5, 'rates': RATES, 'daily_fee': 0})
+        out = headline(h, CAL, ON_PEAK, t, {}, None, D(2026, 9, 27, 18, 5))
+        # 40 + 1040 + 10 (40 less the 30 reported as export) + 20 Wh
+        self.assertEqual((out['today']['grid_kwh'], out['today']['export_kwh']), (1.11, 0.0))
+        c = out['cycle']
+        self.assertEqual((c['grid_kwh'], c['meter_offset_w']), (1.11, 40.0))
+        self.assertAlmostEqual(c['cost'], 0.04 * 0.1 + 1.04 * 0.1 + 0.01 * 0.1 + 0.02 * 0.5, places=2)
 
 
 def state(soc, qc=0, age=2):

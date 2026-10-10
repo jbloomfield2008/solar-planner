@@ -151,7 +151,7 @@ class CoreSimTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         cfg = config.from_dict({'core': {
             'socket': 'tcp://127.0.0.1:0', 'state_file': self.tmp.name + '/core-state.json', 'broadcast_s': 0.2,
-            'simulate': True, 'inverter': {'poll_s': 0.2, 'holding_refresh_s': 0.5, 'standby_watchdog_s': 1.5,
+            'settings_file': self.tmp.name + '/settings.json', 'simulate': True, 'inverter': {'poll_s': 0.2, 'holding_refresh_s': 0.5, 'standby_watchdog_s': 1.5,
                                            'ct_cal_slope': -0.045, 'ct_cal_intercept': 20, 'ct_cal_max_w': 0,
                                            'ct_cal_min_write_s': 0.5},
             'jkbms': {'poll_s': 0.2}}})
@@ -215,6 +215,34 @@ class CoreSimTest(unittest.TestCase):
         self.assertEqual((ct['slope'], ct['max_w'], ct['firmware_min_w']), (-0.045, 0.0, -250.0))
         st = self.client.wait_for(lambda m: m.get('type') == 'state' and 'ct_power_offset_target' in (m['inverter']['data'] or {}))
         self.assertIsNotNone(st['inverter']['data']['ct_power_offset'])
+
+    def test_console_settings(self):
+        self.client.send({'type': 'settings', 'id': 's1', 'values': {'core.jkbms.poll_s': 1.5,
+                                                                      'core.inverter.ct_cal_hyst_w': 30}})
+        r = self.client.wait_for(lambda m: m.get('type') == 'result' and m.get('id') == 's1')
+        self.assertTrue(r['ok'], r)
+        self.assertEqual(r['settings']['values']['core.jkbms.poll_s'], 1.5)
+        self.assertEqual(r['settings']['file']['core.jkbms.poll_s'], 0.2)
+        self.assertEqual(self.core.c.inverter.ct_cal_hyst_w, 30.0, 'applied live')
+        with open(self.tmp.name + '/settings.json') as f:
+            self.assertEqual(json.load(f), {'core.jkbms.poll_s': 1.5, 'core.inverter.ct_cal_hyst_w': 30.0})
+        self.assertIn('settings changed (test): Battery sample time 0.2 s -> 1.5 s', self.core.events[-1]['msg'])
+        st = self.client.wait_for(lambda m: m.get('type') == 'state')
+        self.assertEqual(st['settings']['overrides'], ['core.inverter.ct_cal_hyst_w', 'core.jkbms.poll_s'])
+        for rid, values in (('s2', {'core.inverter.poll_s': 1}), ('s3', {'core.inverter.standby_watchdog_s': 1e6}),
+                            ('s4', {'core.inverter.ct_cal_min_w': 100, 'core.jkbms.poll_s': None}),
+                            ('s5', {'hub.planner.reserve_soc': 30})):
+            self.client.send({'type': 'settings', 'id': rid, 'values': values})
+            r = self.client.wait_for(lambda m, rid=rid: m.get('type') == 'result' and m.get('id') == rid)
+            self.assertFalse(r['ok'], values)
+        self.assertEqual(self.core.c.jkbms.poll_s, 1.5, 'a refused change leaves everything as it was')
+        restarted = Core(config.from_dict({'core': {'settings_file': self.tmp.name + '/settings.json',
+                                                     'socket': 'tcp://127.0.0.1:0'}}),
+                         devices={'inverter': None, 'jk': None, 'emulator_serial': None})
+        self.assertEqual(restarted.c.jkbms.poll_s, 1.5, 'kept across a core restart')
+        self.client.send({'type': 'settings', 'id': 's6', 'values': {'core.jkbms.poll_s': None}})
+        r = self.client.wait_for(lambda m: m.get('type') == 'result' and m.get('id') == 's6')
+        self.assertEqual(r['settings']['values']['core.jkbms.poll_s'], 0.2, 'cleared: back to the file value')
 
     def test_standby_watchdog_restores_normal(self):
         r = self.write([[21, STANDBY]], 'standby')

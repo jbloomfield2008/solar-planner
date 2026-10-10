@@ -2,10 +2,10 @@
 
 Threads, each supervised by the main loop:
 
-* ``jk``        - polls the JK BMS every 5 s.
+* ``jk``        - polls the JK BMS every ``jkbms.poll_s`` (1 s).
 * ``emulator``  - answers the inverter's battery-port polls from the latest JK sample
                   (Luxpower protocol).  Needs nothing but the JK thread.
-* ``inverter``  - polls the meter port every 5 s, refreshes control registers, runs the
+* ``inverter``  - polls the meter port every ``inverter.poll_s`` (5 s), refreshes control registers, runs the
                   CT calibration, performs hub write requests under the safety rules
                   and runs the standby watchdog.
 * ``pi``        - Pi health every 30 s (not critical).
@@ -17,6 +17,7 @@ Pi's wall clock steps at boot.
 """
 from __future__ import annotations
 
+import json
 import logging
 import queue
 import signal
@@ -24,7 +25,7 @@ import threading
 import time
 from collections import deque
 
-from .. import __version__
+from .. import __version__, settings
 from ..config import Config
 from ..devices import bmsemu, flexboss, jkbms, modbus, pi
 from ..devices.flexboss import BIT_NORMAL, H_CT_OFFSET, H_FUNC
@@ -155,7 +156,7 @@ class InverterWorker(Worker):
         core, cfg, inv = self.core, self.core.c.inverter, self.core.devices['inverter']
         stats = core.stats['inverter']
         pv_window: deque = deque()
-        next_poll = next_holding = 0.0
+        last_poll, next_holding = -1e9, 0.0
         while not core.stop.is_set():
             self.beat()
             try:
@@ -163,8 +164,8 @@ class InverterWorker(Worker):
                     self.process_commands(inv)
                     next_holding = 0.0
                 now = time.monotonic()
-                if now >= next_poll:
-                    next_poll = now + cfg.poll_s
+                if now >= last_poll + cfg.poll_s:          # poll_s can change from the console at any time
+                    last_poll = now
                     data = inv.read_inputs()
                     stats.success()
                     pv_window.append((now, data['pv_power']))
@@ -201,7 +202,7 @@ class InverterWorker(Worker):
                 log.exception('inverter worker')
                 stats.failure(e, 'inverter')
                 core.stop.wait(2)
-            core.wake.wait(max(0.05, next_poll - time.monotonic()))
+            core.wake.wait(max(0.05, last_poll + cfg.poll_s - time.monotonic()))
             core.wake.clear()
 
     def process_commands(self, inv) -> None:
@@ -325,6 +326,8 @@ class Core:
         self.events: deque = deque(maxlen=200)
         self.commands: queue.Queue = queue.Queue()
         self.last_standby_assert = time.monotonic()
+        self.settings = settings.Overrides(cfg, 'core')
+        self.settings_lock = threading.Lock()
         self.limiter = bmsemu.ChargeLimiter(self.c.emulator)
         self.ct = CtCalibrator(self.c.inverter)
         self.slave = bmsemu.LuxSlave(self.c.emulator, self.emulator_registers)
@@ -335,6 +338,8 @@ class Core:
         self._polling: bool | None = None
         self._ct_error: str | None = None
         self._last_reason: str | None = None
+        self._uv_latched = False
+        self.load_settings()
 
     # -- shared state ------------------------------------------------------------------------
     def set_jk(self, sample: dict) -> None:
@@ -362,6 +367,43 @@ class Core:
         with self.emu_lock:
             return bmsemu.build_registers(jk, age, self.c.emulator, self.limiter)
 
+    # -- console settings --------------------------------------------------------------------------
+    def load_settings(self) -> None:
+        path = self.c.settings_file
+        try:
+            with open(path, encoding='utf-8') as f:
+                stored = json.load(f)
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError) as e:
+            self.event('warning', f'console settings in {path} unreadable, using the config file: {e}')
+            return
+        skipped = self.settings.load(stored if isinstance(stored, dict) else {})
+        if skipped:
+            self.event('warning', f'console settings ignored: {", ".join(skipped)}')
+        if self.settings.values:
+            log.info('console settings: %s', self.settings.values)
+
+    def change_settings(self, client, msg: dict) -> None:
+        """Apply console overrides from the hub (None clears one), checked here against the same bounds."""
+        values = msg.get('values')
+        try:
+            if not isinstance(values, dict):
+                raise ValueError('expected {"values": {...}}')
+            with self.settings_lock:
+                changes = self.settings.update(values)
+                if self.c.settings_file:
+                    atomic_write_json(self.c.settings_file, self.settings.values)
+        except (ValueError, TypeError) as e:
+            client.send_msg({'type': 'result', 'id': msg.get('id'), 'ok': False, 'error': str(e)})
+            return
+        except OSError as e:
+            self.event('warning', f'settings applied but not saved, they last until the core restarts: {e}')
+        if changes:
+            self.event('info', f'settings changed ({client.name}): {settings.describe(changes)}')
+        self.wake.set()
+        client.send_msg({'type': 'result', 'id': msg.get('id'), 'ok': True, 'settings': self.settings.state()})
+
     # -- events & IPC ----------------------------------------------------------------------------
     def event(self, level: str, msg: str, **data) -> None:
         e = {'type': 'event', 'ts': round(time.time(), 1), 'level': level, 'source': data.pop('source', 'core'),
@@ -384,6 +426,8 @@ class Core:
             self.wake.set()
         elif kind == 'assert_standby':
             self.last_standby_assert = time.monotonic()
+        elif kind == 'settings':
+            self.change_settings(client, msg)
         elif kind == 'ping':
             client.send_msg({'type': 'result', 'id': msg.get('id'), 'ok': True, 'pong': True})
         else:
@@ -422,6 +466,9 @@ class Core:
                 'discharge_ok': bool(regs) and info['discharge_ok'],
                 'answering': regs is not None,
                 'limit_reason': info.get('reason'),
+                'discharge_reason': info.get('dischg_reason'),
+                'uv_latched': bool(info.get('uv_latched')),
+                'uv_mv': self.c.emulator.cell_uv_mv, 'uv_restore_mv': self.c.emulator.cell_uv_restore_mv,
                 **self.stats['emulator'].as_dict(),
             },
             'ct': self.ct.state(now),
@@ -430,6 +477,7 @@ class Core:
                        'standby_watchdog_s': self.c.inverter.standby_watchdog_s,
                        'qc_max_arm_min': self.c.inverter.qc_max_arm_min,
                        'ct_calibration': self.c.inverter.ct_cal_slope != 0},
+            'settings': self.settings.state(),
             'workers': {w.name: {'alive': w.is_alive(), 'age_s': round(w.age(), 1)} for w in self.workers},
             'clients': self.server.client_names(),
         }
@@ -445,6 +493,17 @@ class Core:
 
     def check_transitions(self, snap: dict) -> None:
         emu = snap['emulator']
+        if emu['answering'] and emu['uv_latched'] != self._uv_latched:
+            self._uv_latched = emu['uv_latched']
+            regs = emu['regs']
+            cmin = regs[11] if regs else None
+            e = self.c.emulator
+            if self._uv_latched:
+                self.event('warning', f'cell undervoltage: lowest cell {cmin} mV (limit {e.cell_uv_mv} mV), battery '
+                                      f'discharge not allowed until every cell reaches {e.cell_uv_restore_mv} mV; '
+                                      f'solar still charges, the grid carries the rest')
+            else:
+                self.event('info', f'cell undervoltage cleared: lowest cell {cmin} mV, battery discharge allowed again')
         if emu['limit_reason'] != self._last_reason:
             self._last_reason = emu['limit_reason']
             self.event('info', f"BMS emulator charge limit: {emu['limit_reason']} "

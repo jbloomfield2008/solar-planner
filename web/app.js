@@ -188,7 +188,7 @@ function Tile({ label, value, sub, action }) {
   </div>`;
 }
 
-function Headline({ s, summary, onSettings }) {
+function Headline({ s, summary, onTariff, onSettings }) {
   const inv = s.inverter.data || {};
   const socNow = s.jk?.data?.soc ?? inv.soc;
   const t = summary?.today || {};
@@ -197,7 +197,7 @@ function Headline({ s, summary, onSettings }) {
   const delta = socNow != null && prior != null ? socNow - prior : null;
   const batt = inv.battery_power ?? 0;
   const pct = t.pv_forecast_kwh ? Math.round((t.pv_kwh / t.pv_forecast_kwh) * 100) : null;
-  const setRates = html`<button class="link" onClick=${onSettings}>Set your rates</button>`;
+  const setRates = html`<button class="link" onClick=${onTariff}>Set your rates</button>`;
   let cycleSub = '–';
   let costSub = null;
   let savedSub = null;
@@ -205,7 +205,7 @@ function Headline({ s, summary, onSettings }) {
     const tier = c.tier != null && (c.by_tier || []).length > 1 ? `, tier ${c.tier + 1}` : '';
     cycleSub = `Day ${c.day} of ${c.days} since ${dateLabel(c.start)}${tier}`;
     if (c.configured) {
-      costSub = c.projected_cost != null && c.day >= 3 ? `About ${money(c.projected_cost)} by ${dateLabel(c.end)}` : `Average ${c.avg_rate != null ? `${money(c.avg_rate)}/kWh` : '–'}`;
+      costSub = c.projected_cost != null && c.day >= 3 ? `About ${money(c.projected_cost)} by ${dateLabel(c.end)}` : `Average ${c.avg_rate != null ? `${money(c.avg_rate)}/kWh` : '–'} plus ${money(c.fees)} fees`;
       savedSub = `${kwh(c.saved_kwh, c.saved_kwh < 100 ? 1 : 0)} not bought, ${money(c.home_cost)} without solar and battery`;
     }
     if (c.partial && c.grid_since) {
@@ -217,7 +217,8 @@ function Headline({ s, summary, onSettings }) {
   return html`<section class="headline" aria-labelledby="headline-title">
     <div class="headline-head">
       <h2 id="headline-title" class="vh">Today and this billing cycle</h2>
-      <button class="link" onClick=${onSettings}>Tariff and billing cycle</button>
+      <button class="link" onClick=${onTariff}>Tariff and billing cycle</button>
+      <button class="link" onClick=${onSettings}>Settings</button>
     </div>
     <dl class="tiles">
       <${Tile} label="Solar forecast today" value=${kwh(t.pv_forecast_kwh)} sub=${`Tomorrow ${kwh(t.pv_forecast_tomorrow_kwh)}`} />
@@ -253,6 +254,8 @@ function TariffDialog({ open, onClose, onSaved }) {
         day: String(t.cycle_start_day),
         rates: Object.fromEntries(PERIOD_FIELDS.map(([k]) => [k, String(t.rates[k] ?? 0)])),
         tiers: t.tiers.map((x) => ({ up: x.up_to_kwh == null ? null : String(x.up_to_kwh), adder: String(x.adder) })),
+        offset: String(t.meter_offset_w),
+        fee: String(t.daily_fee),
       })).catch((err) => setError(`Could not load the settings: ${err.message}`));
       d.showModal();
     } else if (!open && d.open) {
@@ -279,6 +282,8 @@ function TariffDialog({ open, onClose, onSaved }) {
       cycle_start_day: Number(form.day),
       rates: Object.fromEntries(PERIOD_FIELDS.map(([k]) => [k, Number(form.rates[k] || 0)])),
       tiers: form.tiers.map((t) => ({ up_to_kwh: t.up == null ? null : Number(t.up), adder: Number(t.adder || 0) })),
+      meter_offset_w: Number(form.offset || 0),
+      daily_fee: Number(form.fee || 0),
     };
     try {
       const r = await fetch('/api/tariff', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
@@ -327,6 +332,14 @@ function TariffDialog({ open, onClose, onSaved }) {
         </table>` : null}
         ${form.tiers.length < 6 ? html`<button type="button" class="link" onClick=${addTier}>Add a tier</button>` : null}
       </fieldset>
+      <label class="field"><span>Base service fee per day</span>
+        <span class="input-unit"><span aria-hidden="true">$</span><input type="number" min="0" max="20" step="0.00001" inputmode="decimal" required
+          value=${form.fee} onInput=${(e) => set({ fee: e.target.value })} /></span>
+        <small>Charged every day whatever you import. Included in the cycle cost; it does not change the savings.</small></label>
+      <label class="field"><span>Meter import the inverter does not see</span>
+        <span class="input-unit"><input type="number" min="0" max="500" step="1" required value=${form.offset}
+          onInput=${(e) => set({ offset: e.target.value })} /><span aria-hidden="true">W</span></span>
+        <small>The CT reads the grid this much low so the inverter never exports. It is added to grid import, and its cost, for every hour recorded.</small></label>
       ${error ? html`<p class="error-text" role="alert">${error}</p>` : null}`}
       <div class="dialog-actions">
         <button type="button" class="btn" onClick=${onClose}>Cancel</button>
@@ -336,9 +349,140 @@ function TariffDialog({ open, onClose, onSaved }) {
   </dialog>`;
 }
 
+// settings the console may change (solar01/settings.py); each overrides the config file until cleared
+const shownValue = (item, v) => (item.type === 'list' ? (v || []).join(', ') : item.type === 'bool' ? !!v : v == null ? '' : String(v));
+function typedValue(item, text) {
+  if (item.type === 'bool') return text;
+  if (item.type === 'list') return text.split(/[\s,]+/).filter(Boolean);
+  if (item.type === 'str') return text.trim();
+  return text === '' ? NaN : Number(text);
+}
+const sameValue = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+const fileText = (item) => (item.type === 'bool' ? (item.file ? 'on' : 'off') : item.type === 'list' ? (item.file.join(', ') || 'none')
+  : item.file === '' ? 'none' : `${item.file}${item.unit && item.unit !== 'hours' ? ` ${item.unit}` : ''}`);
+
+function SettingsDialog({ open, onClose }) {
+  const ref = useRef(null);
+  const [items, setItems] = useState(null);
+  const [form, setForm] = useState({});
+  const [reset, setReset] = useState({});
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+  const load = (list) => {
+    setItems(list);
+    setForm(Object.fromEntries(list.map((i) => [i.key, shownValue(i, i.value)])));
+    setReset({});
+  };
+  useEffect(() => {
+    const d = ref.current;
+    if (!d) return;
+    if (open && !d.open) {
+      setError('');
+      setItems(null);
+      fetch('/api/settings').then((r) => r.json()).then((b) => load(b.items))
+        .catch((err) => setError(`Could not load the settings: ${err.message}`));
+      d.showModal();
+    } else if (!open && d.open) {
+      d.close();
+    }
+  }, [open]);
+  const edit = (key, v) => {
+    setForm((f) => ({ ...f, [key]: v }));
+    setReset((r) => ({ ...r, [key]: false }));
+  };
+  const useFile = (item) => {
+    setForm((f) => ({ ...f, [item.key]: shownValue(item, item.file) }));
+    setReset((r) => ({ ...r, [item.key]: true }));
+  };
+  async function save(e) {
+    e.preventDefault();
+    const values = {};
+    for (const item of items.filter((i) => i.available)) {
+      if (reset[item.key]) {
+        values[item.key] = null;
+        continue;
+      }
+      const v = typedValue(item, form[item.key]);
+      if (Number.isNaN(v)) return setError(`${item.label} needs a number.`);
+      if (!sameValue(v, item.value)) values[item.key] = v;
+    }
+    if (!Object.keys(values).length) return onClose();
+    setBusy(true);
+    setError('');
+    try {
+      const r = await fetch('/api/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ values }) });
+      const body = await r.json();
+      if (!r.ok) throw new Error(body.error || r.statusText);
+      load(body.items);
+      onClose();
+    } catch (err) {
+      setError(`Not saved: ${err.message}`);
+    } finally {
+      setBusy(false);
+    }
+    return undefined;
+  }
+  const groups = [];
+  for (const item of items || []) {
+    const g = groups.find((x) => x.name === item.group);
+    if (g) g.items.push(item);
+    else groups.push({ name: item.group, items: [item] });
+  }
+  const field = (item) => {
+    const id = `set-${item.key.replaceAll('.', '-')}`;
+    const disabled = !item.available;
+    const overridden = item.available && !reset[item.key] && (item.overridden || !sameValue(typedValue(item, form[item.key]), item.file));
+    const origin = !item.available ? html`<small>The core is not connected, so this cannot be read or changed now.</small>`
+      : overridden ? html`<small>${`Config file: ${fileText(item)}. `}<button type="button" class="link" onClick=${() => useFile(item)}>Use the file value</button></small>`
+        : null;
+    if (item.type === 'bool') {
+      return html`<div class="field setting">
+        <label class="check"><input type="checkbox" id=${id} disabled=${disabled} checked=${form[item.key]}
+          onChange=${(e) => edit(item.key, e.target.checked)} /><span>${item.label}</span></label>
+        ${item.help ? html`<small>${item.help}</small>` : null}${origin}
+      </div>`;
+    }
+    const text = item.type === 'str' || item.type === 'list';
+    return html`<div class="field setting">
+      <label for=${id}>${item.label}</label>
+      <span class="input-unit">
+        <input id=${id} type=${text ? 'text' : 'number'} class=${text ? 'wide' : ''} disabled=${disabled} required=${!text}
+          step=${text ? undefined : 'any'} inputmode=${text ? undefined : 'decimal'}
+          title=${item.min != null ? `${item.min} to ${item.max}${item.unit ? ` ${item.unit}` : ''}` : undefined}
+          value=${form[item.key]} onInput=${(e) => edit(item.key, e.target.value)} />
+        ${item.unit && !text ? html`<span aria-hidden="true">${item.unit}</span>` : null}
+      </span>
+      ${item.help ? html`<small>${item.help}</small>` : null}${origin}
+    </div>`;
+  };
+  return html`<dialog class="dialog dialog-wide" ref=${ref} onClose=${onClose} aria-labelledby="settings-title">
+    <form method="dialog" onSubmit=${save}>
+      <h2 id="settings-title">Settings</h2>
+      <p class="dialog-intro">Changes take effect straight away and override the config file. Ports, battery protection limits and other safety settings stay in the config file.</p>
+      ${!items ? html`<p class="empty">${error || 'Loading'}</p>` : html`
+      ${groups.map((g) => html`<fieldset>
+        <legend>${g.name}</legend>
+        <div class="settings-grid">${g.items.map(field)}</div>
+      </fieldset>`)}
+      ${error ? html`<p class="error-text" role="alert">${error}</p>` : null}`}
+      <div class="dialog-actions">
+        <button type="button" class="btn" onClick=${onClose}>Cancel</button>
+        <button type="submit" class="btn btn-primary" disabled=${!items || busy}>${busy ? 'Saving…' : 'Save'}</button>
+      </div>
+    </form>
+  </dialog>`;
+}
+
 // ---------- hero: state of charge across the tariff day ----------------------------------------
 const PERIOD = { super_off_peak: 'Super off-peak', on_peak: 'On-peak', off_peak: 'Off-peak' };
 const periodAt = (bands, t) => (bands.find((b) => t >= b.start && t < b.end) || { kind: 'off_peak' }).kind;
+
+// the BMS bridge's cell undervoltage latch: discharge stops, solar keeps charging, the grid carries the rest
+function dischargeSentence(e) {
+  if (!e?.answering || !e.uv_latched) return '';
+  const low = `A cell fell to the ${num(e.uv_mv / 1000, 2)} V cutoff${e.regs ? ` (lowest now ${num(e.regs[11] / 1000, 2)} V)` : ''}`;
+  return `${low}, so the battery is not discharging until every cell reaches ${num(e.uv_restore_mv / 1000, 2)} V. Solar still charges it and the grid carries the rest. `;
+}
 
 function decisionSentence(pl) {
   const p = pl.plan || {};
@@ -349,9 +493,6 @@ function decisionSentence(pl) {
     return `Manual charge to ${m.target_soc} %${m.eta ? `, expected at ${hhmm(isoTs(m.eta))}` : ''}. It stops by ${by} at the latest.`;
   }
   if (!pl.enabled) return 'The planner is off, so the inverter follows its own settings.';
-  if (p.uv_hold && p.hold) {
-    return `A cell fell to ${num(p.uv_cell_mv / 1000, 2)} V, below ${num(p.cell_uv_standby_mv / 1000, 2)} V. Standby until ${hhmm(isoTs(p.hold_end))} so the BMS does not cut out; the grid carries the house.`;
-  }
   if (p.action === 'stale') return 'No fresh inverter data, so the planner is not changing anything.';
   if (p.action === 'waiting') return 'The planner is waiting for the clock to synchronise.';
   if (p.action === 'starting' || !p.action) return 'The planner is starting.';
@@ -378,9 +519,6 @@ function decisionSentence(pl) {
     if (next && next.kind === 'hold' && next.floor) then = ` The battery is expected to reach the ${p.floor_soc} % floor at ${dayHhmm(isoTs(next.start))}; the grid then carries the house until ${hhmm(isoTs(next.end))}.`;
     if (next && next.kind === 'charge') then = ` The forecast points to a grid charge to ${next.target} % from ${dayHhmm(isoTs(next.start))}.`;
     return `Nothing to do until super off-peak starts at ${dayHhmm(isoTs(p.next_window))}.${then}`;
-  }
-  if (p.forecast_min_soc != null && p.floor_soc != null && p.forecast_min_soc < p.reserve_soc) {
-    return `No grid charge or standby hold needed. The battery dips to about ${p.forecast_min_soc} %, above the ${p.floor_soc} % floor.`;
   }
   return `No grid charge or standby hold needed. The battery stays above the ${p.reserve_soc} % reserve.`;
 }
@@ -413,7 +551,7 @@ function DayStrip({ s }) {
   return html`<section class="panel strip" aria-labelledby="strip-title">
     <div class="strip-head">
       <h2 id="strip-title">${width && width < 640 ? 'State of charge, last 6 hours and next 18' : 'State of charge, last 12 hours and next 24'}</h2>
-      <p class="decision" aria-live="polite">${decisionSentence(pl)}</p>
+      <p class="decision" aria-live="polite">${dischargeSentence(s.emulator)}${decisionSentence(pl)}</p>
     </div>
     <div class="strip-plot" ref=${ref}>
       ${width ? html`<${StripChart} width=${width} now=${now} bands=${bands} measured=${measured} projection=${projection}
@@ -905,7 +1043,7 @@ function BridgePanel({ s }) {
     <p class=${`bridge-status st-${kind}`}><${Icon} kind=${kind} /><span>${sentence}</span></p>
     <${Facts} rows=${[
       ['Charging', e.answering ? `${allowed(e.charge_ok)}, up to ${num(e.max_charge_a)} A at ${num(e.charge_voltage, 1)} V` : '–'],
-      ['Discharging', e.answering ? `${allowed(e.discharge_ok)}, up to ${num(e.max_discharge_a)} A` : '–'],
+      ['Discharging', e.answering ? `${allowed(e.discharge_ok)}${e.discharge_ok ? `, up to ${num(e.max_discharge_a)} A` : `: ${e.discharge_reason}`}` : '–'],
       ['Limit reason', e.limit_reason],
       ['BMS data age', s.jk.age_s == null ? 'no data' : `${num(s.jk.age_s, 1)} s`],
       ['Polls answered', `${num(e.polls)}${e.unanswered ? `, ${num(e.unanswered)} unanswered` : ''}`],
@@ -1286,7 +1424,7 @@ function PlannerPanel({ s }) {
       ['Grid charge', p.target_soc != null ? `to ${p.target_soc} %, ${num(p.grid_kwh, 1)} kWh from ${dayHhmm(isoTs(p.start_at))}` : 'not planned'],
       ['Standby hold', p.hold_start ? `${hhmm(isoTs(p.hold_start))} to ${hhmm(isoTs(p.hold_end))}${p.hold ? ', active now' : ''}` : 'not planned'],
       ['Next 24 hours', (p.actions || []).length ? p.actions.map((a) => `${a.kind === 'hold' ? 'standby hold' : `grid charge to ${a.target} %`} ${dayHhmm(isoTs(a.start))} to ${hhmm(isoTs(a.end))}${a.preview ? ' (forecast)' : ''}`).join(', ') : 'no holds or charges expected'],
-      ['Stop time', p.actions_stop ? `holds and charges end at ${hhmm(isoTs(p.actions_stop))}, 10 minutes before the window closes` : 'outside super off-peak'],
+      ['Stop time', p.actions_stop ? `holds and charges end at ${hhmm(isoTs(p.actions_stop))}, ${num((isoTs(p.window_end) - isoTs(p.actions_stop)) / 60)} minutes before the window closes` : 'outside super off-peak'],
       ['Planned state of charge', p.projected_min_soc != null ? `lowest ${p.projected_min_soc} %, ${p.projected_soc_next_window} % at the next window` : '–'],
       ['Solar forecast', `${num(p.pv_forecast_today_kwh, 1)} kWh today, ${num(p.pv_forecast_tomorrow_kwh, 1)} kWh tomorrow`],
       ['Forecast correction', p.pv_live_scale != null ? `measured solar is ${num(p.pv_live_scale * 100)} % of forecast` : '–'],
@@ -1386,6 +1524,7 @@ function Events({ events }) {
 // ---------- app ----------------------------------------------------------------------------------------
 function App() {
   const { state: s, connected, events, lastRx } = useLive();
+  const [tariff, setTariff] = useState(false);
   const [settings, setSettings] = useState(false);
   const [summaryKey, setSummaryKey] = useState(0);
   const [summary] = usePoll(`/api/summary?k=${summaryKey}`, 60000);
@@ -1395,7 +1534,7 @@ function App() {
     <${Header} s=${s} connected=${connected} lastRx=${lastRx} />
     <main class="page">
       ${s.simulate ? html`<p class="banner">Simulated devices: these readings do not come from the inverter or the battery.</p>` : null}
-      <${Headline} s=${s} summary=${summary} onSettings=${() => setSettings(true)} />
+      <${Headline} s=${s} summary=${summary} onTariff=${() => setTariff(true)} onSettings=${() => setSettings(true)} />
       <${DayStrip} s=${s} />
       <div class="row-now">
         <div class="stack"><${PowerFlow} s=${s} /><${CtPanel} s=${s} /></div>
@@ -1410,7 +1549,8 @@ function App() {
       </div>
       <${Events} events=${events} />
     </main>
-    <${TariffDialog} open=${settings} onClose=${() => setSettings(false)} onSaved=${() => setSummaryKey((k) => k + 1)} />`;
+    <${TariffDialog} open=${tariff} onClose=${() => setTariff(false)} onSaved=${() => setSummaryKey((k) => k + 1)} />
+    <${SettingsDialog} open=${settings} onClose=${() => setSettings(false)} />`;
 }
 
 const root = document.getElementById('app');

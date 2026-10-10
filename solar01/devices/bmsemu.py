@@ -44,11 +44,30 @@ ST_CHARGE_OK, ST_DISCHARGE_OK = 0x0001, 0x0002
 
 class ChargeLimiter:
     """Charge current taper with a latch: above taper_end the charge is forbidden and the
-    voltage request drops to float until the highest cell falls below taper_reset."""
+    voltage request drops to float until the highest cell falls below taper_reset.
+
+    Cell undervoltage latch: once any cell is at or below cell_uv_mv, discharge is not allowed
+    until every cell is back at or above cell_uv_restore_mv.  Charging stays allowed, so the
+    inverter keeps using PV (charging the battery, serving the house) and takes the rest of the
+    load from the grid, instead of the BMS cutting out on undervoltage."""
 
     def __init__(self, cfg):
         self.cfg = cfg
         self.taper_latched = False
+        self.uv_latched = False
+
+    def discharge_ok(self, jk: dict) -> tuple[bool, str]:
+        c = self.cfg
+        cmin = int(jk.get('cell_voltage_min') or 0)
+        if cmin and cmin <= c.cell_uv_mv:
+            self.uv_latched = True
+        elif cmin >= c.cell_uv_restore_mv:
+            self.uv_latched = False
+        if not jk.get('discharge_mos_on', True):
+            return False, 'JK discharge MOS off'
+        if self.uv_latched:
+            return False, f'cell undervoltage (lowest cell {cmin} mV; allowed again at {c.cell_uv_restore_mv} mV)'
+        return True, 'normal'
 
     def max_charge_a(self, jk: dict) -> tuple[float, str]:
         c = self.cfg
@@ -93,7 +112,7 @@ def build_registers(jk: dict | None, age_s: float, cfg, limiter: ChargeLimiter):
     else:
         chg_a, reason = limiter.max_charge_a(jk)
     chg_volt = cfg.float_volt if limiter.taper_latched else cfg.chg_volt
-    dischg_ok = bool(jk.get('discharge_mos_on', True)) and not (cmin and cmin <= cfg.cell_uv_mv)
+    dischg_ok, dischg_reason = limiter.discharge_ok(jk)
     dischg_a = cfg.dischg_max_a if dischg_ok else 0.0
     status = (ST_CHARGE_OK if chg_a > 0 else 0) | (ST_DISCHARGE_OK if dischg_ok else 0)
     regs = [
@@ -115,7 +134,8 @@ def build_registers(jk: dict | None, age_s: float, cfg, limiter: ChargeLimiter):
         cycles & 0xFFFF,
     ]
     info = {'age': age_s, 'stale': stale, 'max_chg_a': chg_a, 'max_dischg_a': dischg_a, 'chg_volt': chg_volt,
-            'reason': reason, 'status': status, 'cell_max': cmax,
+            'reason': reason, 'dischg_reason': dischg_reason, 'uv_latched': limiter.uv_latched, 'status': status,
+            'cell_max': cmax,
             'charge_ok': bool(status & ST_CHARGE_OK), 'discharge_ok': bool(status & ST_DISCHARGE_OK)}
     return regs, info
 

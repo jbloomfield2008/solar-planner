@@ -16,7 +16,7 @@ Home Assistant, and the system should be observable locally when HA is down.
 
 ```
                  +------------------------- solar01-core (root, no network) -------------------------+
- JK BMS  --RS485-|--> jk thread ----latest sample----> emulator thread --RS485--> inverter battery port |
+ JK BMS  --RS485-|--> jk thread 1 s --latest sample--> emulator thread --RS485--> inverter battery port |
  inverter meter -|--> inverter thread: poll 5 s, CT calibration, safety-checked writes, standby watchdog |
  port (RS485)    |    pi thread: undervoltage, temperature                                                |
                  |    main loop: snapshot every 2 s -> /run/solar01/core.sock + core-state.json,          |
@@ -97,9 +97,30 @@ is marked partial and its grid, cost and savings cover only the hours with grid 
 The tariff is edited in the console (*Tariff and billing cycle*) and stored in the database (kv `tariff`,
 `solar01/hub/tariff.py`): a $/kWh rate for super off-peak, off-peak and on-peak (periods from the planner
 calendar and `on_peak`), optional usage tiers that add an amount per kWh by the cycle's running grid import
-(negative for a baseline credit), and the day of the month the cycle starts. *Cost* prices grid import;
-*saved* is the same hours' home use priced the same way, minus that cost. Seasonal rate changes are entered by
+(negative for a baseline credit), a daily base service fee (default $0.74, SDG&E), and the day of the month the
+cycle starts. *Cost* prices grid import and adds the fee for each day of the cycle so far (the projection, for
+every day); *saved* is the same hours' home use priced the same way, minus that cost, so the fee, paid either
+way, does not change it. Seasonal rate changes are entered by
 hand.
+
+The CT is set to read the grid about 40 W low so the inverter never exports, so while the inverter shows 0 W
+the utility meter is still taking about 40 W. Grid import in the headline (today and the cycle, and so cost and
+savings) is corrected for that: each hour gets the dialog's *meter import the inverter does not see* (tariff
+`meter_offset_w`, default 40 W) times the time recorded in it, less any export the inverter reported that hour up
+to that amount. It is applied when the figures are shown, not stored, so changing it re-prices the whole cycle.
+
+### Settings in the console
+
+*Settings* in the console changes about 40 settings at run time: battery and inverter sample times, CT
+calibration, the planner's floor, reserve and margins, holds and quick-charge timing, the time-of-use windows and
+extra holidays, the site location and a few housekeeping intervals (the list, with labels and bounds, is
+`solar01/settings.py`). A console value overrides `/etc/solar01/config.toml` until it is cleared (*Use the file
+value*), takes effect at once, and is recorded as an event. Hub settings are kept in the database (kv `settings`).
+Core settings are sent to the core, which checks them against the same bounds, applies them and keeps them in
+`/var/lib/solar01-core/settings.json`, so the core never needs the hub to start with them. A save is all or
+nothing. Serial ports, the BMS emulator's current, voltage and temperature limits, the standby watchdog, the longest quick-charge countdown,
+the MQTT connection, the web listener and the time zone stay in the config file only. Bounds hold safety limits
+too: inverter polling no faster than 5 s, CT offset within the firmware range, at least 60 s between CT writes.
 
 ### Manual charge
 
@@ -142,7 +163,7 @@ One MQTT connection carries all devices; the bridge and planner entities also wa
 
 ## What we learned (kept in code comments and tests)
 
-**Inverter meter port** - Modbus RTU 19200 8N1, slave 1, never polled faster than every 5 s.
+**Inverter meter port** - Modbus RTU 19200 8N1, slave 1, never polled faster than every 5 s (`inverter.poll_s`).
 Input blocks of 40 at 0/40/125/165/205. I172/173 = total load energy (U32, 0.1 kWh); no per-leg grid
 power exists. I210 = quick-charge seconds left. H0 high byte: bits 0-1 battery type (1 lead-acid,
 2 lithium), bits 2-6 lithium brand (0 = EG4, required for the closed loop; inferred from 0x8100 before
@@ -156,17 +177,26 @@ starts a 60-minute default). H119 CT offset LSB is 0.1 W (the 18kPV document say
 16 little-endian registers in the Luxpower layout documented in `solar01/devices/bmsemu.py`. A status
 word of 0 shows "Forbidden" on the LCD. It polls only when the battery type is Lithium, brand 0.
 
-**JK BMS** - classic "NW" protocol at 115200; current sign bit set = charging; temperatures above 100
+**JK BMS** - classic "NW" protocol at 115200, polled every 1 s (`jkbms.poll_s`); a poll ends as soon as the
+reply's length field says it is complete. Current sign bit set = charging; temperatures above 100
 are negative. Frames with the wrong cell count or implausible values are dropped because the emulator
 forwards them to the inverter.
 
-**Planner** - see the docstring in `solar01/hub/planner/model.py`. The battery may dip below the 20 %
-reserve; the planner acts only if the forecast would take it below the 15 % floor (`floor_soc`) before the next
-super off-peak window, sizes what it does to keep the reserve, and never grid-charges outside a window. Outside
-the windows a battery at the floor is held in standby while PV cannot carry the house, until the next window
-(decided 2026-09-27). Any cell below 2.8 V (`cell_uv_standby_mv`, fresh BMS data) also puts the inverter in
-standby until the next window, so the BMS never trips on undervoltage; this sits on top of the emulator already
-reporting discharge forbidden at `cell_uv_mv`. Holds and grid charges are only used to close a forecast shortfall and are scheduled as late in the window as possible; every hold and charge
+**Cell undervoltage** - when any cell is at or below `cell_uv_mv` (2.8 V) the emulator reports discharge not
+allowed and 0 A max discharge, with charging still allowed, and keeps that latched until every cell is at or
+above `cell_uv_restore_mv` (3.0 V); both can be set in the console. The intent is that the inverter keeps using
+PV (charging the battery, serving the house) and takes the rest of the load from the grid, where standby would
+idle PV too. Being tested live from 2026-09-28. The latch is not kept across a core restart: with cells between
+the two voltages the battery may discharge again until the cutoff.
+
+**Planner** - see the docstring in `solar01/hub/planner/model.py`. The planner always plans around the
+reserve (`reserve_soc`): inside a super off-peak window, if the forecast would take the battery below the reserve
+before the next window (or it is already below), it holds standby and/or grid-charges just enough to stay above
+it (since 2026-10-08; before that it acted only below the floor, and a 10 % floor let a night end at 14 % with a
+cell at 2.8 V). The floor (`floor_soc`) is not planned to: it is the buffer under the reserve for use above the
+forecast. The planner never grid-charges outside a window; outside the windows a battery at the floor is held in
+standby while PV cannot carry the house, until the next window (decided 2026-09-27). Cell undervoltage is not the planner's job (since 2026-09-28): standby also idles PV, so
+the BMS emulator handles it instead (below). Holds and grid charges are only used to close a forecast shortfall and are scheduled as late in the window as possible; every hold and charge
 ends 10 min before the window closes, because the inverter takes about 5 minutes to return to normal after
 standby or a quick charge; the projection covers 24 hours, previewing what later windows would decide; SOC comes from the BMS; the charge rate is capped by H101 and the emulator's
 limit. Margins set by the user: load 1.05, PV 0.9.

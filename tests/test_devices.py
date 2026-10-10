@@ -1,5 +1,6 @@
 """Device protocol tests: Modbus framing, FlexBoss decoding, JK frame parsing, Lux battery emulator."""
 import struct
+import time
 import unittest
 
 from solar01.config import EmulatorConfig
@@ -161,9 +162,25 @@ class JkTest(unittest.TestCase):
 
     def test_poll_uses_request(self):
         ser = FakeSerial({jkbms.REQUEST: jk_frame()})
-        bms = jkbms.JkBms('fake', settle_s=0, serial_factory=lambda *a: ser)
+        bms = jkbms.JkBms('fake', serial_factory=lambda *a: ser)
         self.assertEqual(bms.poll()['soc'], 51)
         self.assertEqual(ser.written, [jkbms.REQUEST])
+
+    def test_poll_reads_one_frame_without_waiting(self):
+        ser = FakeSerial({jkbms.REQUEST: b'\x00N\xffN' + jk_frame() + b'NW\x00\x10more'})
+        bms = jkbms.JkBms('fake', reply_timeout_s=5, serial_factory=lambda *a: ser)
+        t0 = time.monotonic()
+        self.assertEqual(bms.poll()['soc'], 51, 'noise before the frame is skipped')
+        self.assertLess(time.monotonic() - t0, 1, 'returns when the frame is complete, not at the timeout')
+        self.assertEqual(ser.buf, b'NW\x00\x10more', 'nothing read past the frame')
+
+    def test_poll_times_out(self):
+        ser = FakeSerial({jkbms.REQUEST: jk_frame()[:150]})
+        bms = jkbms.JkBms('fake', reply_timeout_s=0.05, serial_factory=lambda *a: ser)
+        self.assertIsNone(bms.poll())
+        ser = FakeSerial({jkbms.REQUEST: b'NW\xff\xff' + b'\x00' * 300})
+        bms = jkbms.JkBms('fake', reply_timeout_s=5, serial_factory=lambda *a: ser)
+        self.assertIsNone(bms.poll(), 'an implausible length is rejected at once')
 
 
 JK = {'capacity': 280, 'cell_voltage_max': 3436, 'cell_voltage_min': 3410, 'charge_mos_on': True, 'current': -0.4,
@@ -226,6 +243,21 @@ class EmulatorTest(unittest.TestCase):
         self.assertEqual((regs[7], regs[1]), (2, 0))
         regs, _ = self.build(dict(JK, cell_voltage_min=2800))
         self.assertEqual(regs[7] & 2, 0)
+
+    def test_undervoltage_latch(self):
+        """At the cutoff discharge stops (charging stays allowed, so PV keeps working) until every cell recovers."""
+        seen = []
+        for cmin in (2850, 2800, 2900, 2990, 3000, 2900):
+            regs, info = self.build(dict(JK, cell_voltage_min=cmin, cell_voltage_max=3300))
+            seen.append((regs[7], regs[2], info['uv_latched']))
+        self.assertEqual(seen[0], (3, 1500, False))
+        self.assertEqual(seen[1], (1, 0, True), 'charge allowed, discharge not, 0 A')
+        self.assertEqual(seen[2:4], [(1, 0, True)] * 2, 'latched until every cell reaches the restore voltage')
+        self.assertEqual(seen[4:], [(3, 1500, False)] * 2, 'released; 2900 mV alone does not latch again')
+        self.cfg.cell_uv_restore_mv = 3100                    # changed from the console
+        self.build(dict(JK, cell_voltage_min=2790))
+        _, info = self.build(dict(JK, cell_voltage_min=3050))
+        self.assertIn('3100 mV', info['dischg_reason'])
 
     def test_stale_then_dead(self):
         regs, info = self.build(JK, age=60)

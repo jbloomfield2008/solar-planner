@@ -25,6 +25,7 @@ class Store:
         self.core_link = None
         self.planner = None
         self.mqtt = None
+        self.settings = None                  # ConsoleSettings
         self.state_listeners: list = []
         self.subscribers: set[asyncio.Queue] = set()
         self.last_core_event_ts = float(history.get('last_core_event_ts', 0.0))
@@ -133,6 +134,8 @@ class Store:
                                     + (f' (battery type {mode})' if mode and mode != 'lithium' else ''))
         elif not emu.get('charge_ok'):
             h['emulator'] = _status('warn', f"charge forbidden: {emu.get('limit_reason')}")
+        elif not emu.get('discharge_ok'):
+            h['emulator'] = _status('warn', f"discharge not allowed: {emu.get('discharge_reason')}")
         else:
             h['emulator'] = _status('ok', f"closed loop, {emu.get('max_charge_a')} A charge limit")
         ct = (s or {}).get('ct') or {}

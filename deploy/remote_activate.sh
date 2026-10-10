@@ -42,6 +42,7 @@ if [ -n "$CUR" ] && [ "$RESTART_CORE" = auto ]; then
   if diff -rq -x __pycache__ "$CUR/solar01/core" "$REL/solar01/core" >/dev/null &&
      diff -rq -x __pycache__ "$CUR/solar01/devices" "$REL/solar01/devices" >/dev/null &&
      cmp -s "$CUR/solar01/ipc.py" "$REL/solar01/ipc.py" && cmp -s "$CUR/solar01/config.py" "$REL/solar01/config.py" &&
+     cmp -s "$CUR/solar01/settings.py" "$REL/solar01/settings.py" &&
      cmp -s "$CUR/solar01/util.py" "$REL/solar01/util.py" && cmp -s "$CUR/solar01/__main__.py" "$REL/solar01/__main__.py" &&
      cmp -s "$CUR/deploy/solar01-core.service" "$REL/deploy/solar01-core.service"; then
     core_changed=no

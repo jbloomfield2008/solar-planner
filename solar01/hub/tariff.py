@@ -5,11 +5,17 @@ Pure functions.  The settings are edited in the web console and kept in the hist
 
     {"cycle_start_day": 5,                                   1..31, clamped to the month's length
      "rates": {"super_off_peak": 0.12, "off_peak": 0.45, "on_peak": 0.62},       $/kWh
-     "tiers": [{"up_to_kwh": 300, "adder": -0.1}, {"up_to_kwh": null, "adder": 0}]}
+     "tiers": [{"up_to_kwh": 300, "adder": -0.1}, {"up_to_kwh": null, "adder": 0}],
+     "meter_offset_w": 40,                                    W, 0..500
+     "daily_fee": 0.74}                                       $ per day, 0..20
 
 Each kWh costs the rate of the TOU period it was used in plus the adder of the usage tier the
 cycle's running total is in (a kWh that crosses a tier boundary is split).  No tiers means no
-adders.  The last tier is open-ended (up_to_kwh null).
+adders.  The last tier is open-ended (up_to_kwh null).  daily_fee is the fixed base service charge,
+billed for every day of the cycle whatever is imported.
+
+meter_offset_w: the CT is set to read the grid about this much low, so that the inverter never
+exports; the utility meter sees that much more import than the inverter reports (see summary.py).
 """
 from __future__ import annotations
 
@@ -21,7 +27,10 @@ from .planner.calendar import parse_windows
 PERIODS = ('super_off_peak', 'off_peak', 'on_peak')
 MAX_TIERS = 6
 
-DEFAULT = {'cycle_start_day': 1, 'rates': {k: 0.0 for k in PERIODS}, 'tiers': []}
+METER_OFFSET_W = 40.0
+DAILY_FEE = 0.74                     # SDG&E base services charge, $/day
+DEFAULT = {'cycle_start_day': 1, 'rates': {k: 0.0 for k in PERIODS}, 'tiers': [], 'meter_offset_w': METER_OFFSET_W,
+           'daily_fee': DAILY_FEE}
 
 
 def _number(v, name, lo=None, hi=None) -> float:
@@ -62,7 +71,9 @@ def validate(data) -> dict:
                 raise ValueError(f'tier {i + 1} limit must be above {prev:g} kWh')
             prev = up
         tiers.append({'up_to_kwh': up, 'adder': _number(t.get('adder', 0.0), f'tier {i + 1} adder', -10, 10)})
-    return {'cycle_start_day': int(day), 'rates': rates, 'tiers': tiers}
+    offset = _number(data.get('meter_offset_w', METER_OFFSET_W), 'meter_offset_w', 0, 500)
+    fee = _number(data.get('daily_fee', DAILY_FEE), 'daily_fee', 0, 20)
+    return {'cycle_start_day': int(day), 'rates': rates, 'tiers': tiers, 'meter_offset_w': offset, 'daily_fee': fee}
 
 
 def configured(t: dict) -> bool:
